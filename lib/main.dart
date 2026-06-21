@@ -1,51 +1,54 @@
-import 'package:flutter/material.dart';
+import 'dart:io';
+import 'dart:math';
 
-void main() {
-  runApp(const MyApp());
+import 'package:file_manager/controller/file_manager_controller.dart';
+import 'package:file_manager/file_manager.dart';
+import 'package:flutter/material.dart';
+import 'package:memefolder/config/theme.dart';
+import 'package:memefolder/prefs.dart';
+import 'package:memefolder/widgets/file_preview.dart';
+import 'package:memefolder/widgets/folder_view.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:multi_split_view/multi_split_view.dart';
+import 'package:provider/provider.dart';
+import 'helpers/styled_inputfields.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized();
+  JustAudioMediaKit.ensureInitialized();
+  await PlayerPrefs.init();
+  runApp(
+    ChangeNotifierProvider(
+      create: (_) {
+        final theme = ThemeModel();
+        theme.dark = PlayerPrefs.getBool("isDarkMode", true);
+        theme.accent = Color(PlayerPrefs.getInt("AccentColor", 0xFF6A79D7));
+        return theme;
+      },
+      child: const MyApp(),
+    ),
+  );
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
+    final theme = Provider.of<ThemeModel>(context);
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'meme folder',
+      themeMode: theme.dark ? ThemeMode.dark : ThemeMode.light,
+      theme: buildTheme(Brightness.light, theme.accent),
+      home: const MyHomePage(title: 'meme folder'),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
 
   final String title;
 
@@ -54,69 +57,198 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  late MultiSplitViewController _controller;
+  late final TextEditingController _pathController;
+  final FileManagerController fileController = FileManagerController();
+  bool _controllerInitialized = false;
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+  // --- new state ---
+  final List<String> _history = [];
+  int _historyIndex = -1;
+  bool _isGrid = false;
+  double _folderScale = 1.0;
+  File? _selectedFile;
+
+  // navigate with history tracking
+  void _navigateTo(String path) {
+    final dir = Directory(path);
+    if (!dir.existsSync()) return;
+
+    // drop any forward history when navigating new path
+    if (_historyIndex < _history.length - 1) {
+      _history.removeRange(_historyIndex + 1, _history.length);
+    }
+
+    _history.add(path);
+    _historyIndex = _history.length - 1;
+    PlayerPrefs.setString("main_folder", path);
+    _pathController.text = path;
+    fileController.openDirectory(dir);
+    setState(() {});
+  }
+
+  void _goBack() {
+    if (_historyIndex > 0) {
+      _historyIndex--;
+      final path = _history[_historyIndex];
+      _pathController.text = path;
+      PlayerPrefs.setString("main_folder", path);
+      fileController.openDirectory(Directory(path));
+      setState(() {});
+    }
+  }
+
+  void _goForward() {
+    if (_historyIndex < _history.length - 1) {
+      _historyIndex++;
+      final path = _history[_historyIndex];
+      _pathController.text = path;
+      PlayerPrefs.setString("main_folder", path);
+      fileController.openDirectory(Directory(path));
+      setState(() {});
+    }
+  }
+
+  void _goUp() {
+    final current = _pathController.text;
+    final parent = Directory(current).parent.path;
+    if (parent != current) _navigateTo(parent);
+  }
+
+  String _getMainFolder() {
+    String saved = PlayerPrefs.getString("main_folder");
+    if (saved.trim().isEmpty) {
+      saved = Platform.environment['HOME'] ?? '.';
+      PlayerPrefs.setString("main_folder", saved);
+    }
+    if (!Directory(saved).existsSync()) {
+      saved = Platform.environment['HOME'] ?? '.';
+    }
+    return saved;
   }
 
   @override
+  void initState() {
+    super.initState();
+    final initial = _getMainFolder();
+    _pathController = TextEditingController(text: initial);
+    _isGrid = PlayerPrefs.getBool("is_grid", false);
+    _folderScale = PlayerPrefs.getFloat("folder_scale", 1.0).clamp(0.0, 1.0);
+    _navigateTo(initial); // seeds history
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_controllerInitialized) {
+      _initController();
+      _controllerInitialized = true;
+    }
+  }
+
+  void _initController() {
+    double savedFlex = PlayerPrefs.getFloat("split_flex", 0.8);
+    if (savedFlex < 0.05 || savedFlex > 0.95) savedFlex = 0.8;
+
+    _controller = MultiSplitViewController(
+      areas: [
+        Area(
+          flex: savedFlex,
+          builder: (context, area) => FileBrowserPane(
+            currentPath: _pathController.text,
+            pathController: _pathController,
+            isGrid: _isGrid,
+            folderScale: _folderScale,
+            canGoBack: _historyIndex > 0,
+            canGoForward: _historyIndex < _history.length - 1,
+            onBack: _goBack,
+            onForward: _goForward,
+            onUp: _goUp,
+            onToggleGrid: () {
+              setState(() {
+                _isGrid = !_isGrid;
+              });
+              PlayerPrefs.setBool("is_grid", _isGrid);
+            },
+            onScaleChanged: (value) {
+              setState(() {
+                _folderScale = value;
+              });
+              PlayerPrefs.setFloat("folder_scale", _folderScale);
+            },
+            onNavigate: _navigateTo,
+            onRefresh: () => _navigateTo(_pathController.text),
+            onSelectedFileChanged: (file) {
+              setState(() {
+                _selectedFile = file;
+              });
+            },
+          ),
+          min: 0.1,
+        ),
+        Area(
+          min: max(0.1, 100 / MediaQuery.of(context).size.width),
+          flex: 1.0 - savedFlex,
+          builder: (context, area) => FilePreviewPane(file: _selectedFile),
+        ),
+      ],
+    );
+  }
+
+  void _saveFlex() =>
+      PlayerPrefs.setFloat("split_flex", _controller.areas[0].flex ?? 0.8);
+
+  @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
+        scrolledUnderElevation: 0,
+        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+        title: Row(
+          spacing: 12,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            IconButton(onPressed: () {}, icon: Icon(Icons.menu)),
+            Expanded(
+              child: TextField(
+                decoration: newInputDeco(
+                  context,
+                ).copyWith(hintText: "context..."),
+                style: newInputStyle(context).copyWith(
+                  fontFamily: "Syne",
+                  fontVariations: [
+                    FontVariation('wdth', 2800),
+                    FontVariation('wght', 600),
+                  ],
+                ),
+              ),
+            ),
+            FloatingActionButton(
+              mini: true,
+              onPressed: () {},
+              child: Icon(
+                Icons.search,
+                size: 28,
+                color: Theme.of(context).colorScheme.surface,
+              ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+      body: MultiSplitViewTheme(
+        data: MultiSplitViewThemeData(dividerThickness: 3),
+        child: MultiSplitView(
+          controller: _controller,
+          onDividerDragEnd: (index) => _saveFlex(),
+        ),
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _pathController.dispose();
+    fileController.dispose();
+    super.dispose();
   }
 }
