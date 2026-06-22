@@ -4,7 +4,9 @@ import 'dart:math';
 import 'package:file_manager/controller/file_manager_controller.dart';
 import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
+import 'package:memefolder/backend/custom_tags_store.dart';
 import 'package:memefolder/config/theme.dart';
+import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/main_drawer.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
@@ -15,7 +17,7 @@ import 'package:just_audio_media_kit/just_audio_media_kit.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:provider/provider.dart';
-import 'helpers/styled_inputfields.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -25,6 +27,8 @@ void main() async {
   JustAudioMediaKit.ensureInitialized();
   setNavigatorKey(navigatorKey);
   await PlayerPrefs.init();
+  sqfliteFfiInit();
+  databaseFactory = databaseFactoryFfi;
   runApp(
     ChangeNotifierProvider(
       create: (_) {
@@ -67,24 +71,22 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
   late MultiSplitViewController _controller;
   late final TextEditingController _pathController;
   final FileManagerController fileController = FileManagerController();
   bool _controllerInitialized = false;
 
-  // --- new state ---
   final List<String> _history = [];
   int _historyIndex = -1;
   bool _isGrid = false;
   double _folderScale = 1.0;
   File? _selectedFile;
 
-  // navigate with history tracking
   void _navigateTo(String path) {
     final dir = Directory(path);
     if (!dir.existsSync()) return;
 
-    // drop any forward history when navigating new path
     if (_historyIndex < _history.length - 1) {
       _history.removeRange(_historyIndex + 1, _history.length);
     }
@@ -140,11 +142,17 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
+    CustomTagsStore.instance.load();
     final initial = _getMainFolder();
     _pathController = TextEditingController(text: initial);
     _isGrid = PlayerPrefs.getBool("is_grid", false);
     _folderScale = PlayerPrefs.getFloat("folder_scale", 1.0).clamp(0.0, 1.0);
-    _navigateTo(initial); // seeds history
+    _navigateTo(initial);
+  }
+
+  void _applyFilter() {
+    final text = searchController.text.trim();
+    FilterService.instance.setQuery(text);
   }
 
   @override
@@ -211,32 +219,72 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        scrolledUnderElevation: 0,
-        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-        title: Row(
-          spacing: 32,
-          children: [
-            Expanded(child: contextBar(context)),
-            FloatingActionButton(
-              mini: true,
-              onPressed: () {},
-              child: Icon(
-                Icons.search,
-                size: 28,
-                color: readableOn(Theme.of(context).colorScheme.primary),
+      key: _scaffoldKey,
+      drawer: buildDrawer(context),
+      body: Column(
+        children: [
+          SafeArea(
+            bottom: false,
+            child: Container(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 8, 16, 8),
+                    child: Row(
+                      spacing: 16,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.menu),
+                          onPressed: () =>
+                              _scaffoldKey.currentState?.openDrawer(),
+                        ),
+                        Expanded(child: contextBar(context)),
+                        FloatingActionButton(
+                          mini: true,
+                          onPressed: _applyFilter,
+                          backgroundColor: Theme.of(
+                            context,
+                          ).colorScheme.primary,
+                          child: Icon(
+                            Icons.search,
+                            size: 28,
+                            color: readableOn(
+                              Theme.of(context).colorScheme.primary,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  ValueListenableBuilder<bool>(
+                    valueListenable: ContextBarState.isFocused,
+                    builder: (context, focused, _) {
+                      return AnimatedSize(
+                        duration: const Duration(milliseconds: 220),
+                        curve: Curves.easeOutCubic,
+                        alignment: Alignment.topCenter,
+                        child: focused
+                            ? ColorLegendBar()
+                            : const SizedBox(width: double.infinity),
+                      );
+                    },
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
-      ),
-      drawer: buildDrawer(context),
-      body: MultiSplitViewTheme(
-        data: MultiSplitViewThemeData(dividerThickness: 3),
-        child: MultiSplitView(
-          controller: _controller,
-          onDividerDragEnd: (index) => _saveFlex(),
-        ),
+          ),
+          Expanded(
+            child: MultiSplitViewTheme(
+              data: MultiSplitViewThemeData(dividerThickness: 3),
+              child: MultiSplitView(
+                controller: _controller,
+                onDividerDragEnd: (index) => _saveFlex(),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

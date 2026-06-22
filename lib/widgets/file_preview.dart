@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
 
@@ -86,6 +87,8 @@ class FilePreviewPane extends StatelessWidget {
                         _FileActionButtons(file: currentFile),
                         const SizedBox(height: 12),
                         _FileMetadataSection(file: currentFile),
+                        const SizedBox(height: 12),
+                        _AudioMetadataSection(file: currentFile),
                       ],
                     ],
                   ),
@@ -501,6 +504,191 @@ class _InfoItem {
   });
 }
 
+class _AudioMetadataSection extends StatefulWidget {
+  const _AudioMetadataSection({required this.file});
+  final File file;
+
+  @override
+  State<_AudioMetadataSection> createState() => _AudioMetadataSectionState();
+}
+
+class _AudioMetadataSectionState extends State<_AudioMetadataSection> {
+  late Future<Map<String, String?>> _future;
+
+  static const _audioExts = {
+    'mp3',
+    'ogg',
+    'wav',
+    'flac',
+    'aac',
+    'm4a',
+    'opus',
+    'wma',
+    'aiff',
+    'aif',
+    'alac',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _loadMeta(widget.file.path);
+  }
+
+  @override
+  void didUpdateWidget(covariant _AudioMetadataSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.path != widget.file.path) {
+      _future = _loadMeta(widget.file.path);
+    }
+  }
+
+  Future<Map<String, String?>> _loadMeta(String path) {
+    final ext = path.split('.').last.toLowerCase();
+    return _audioExts.contains(ext) ? _extract(path) : Future.value({});
+  }
+
+  Future<Map<String, String?>> _extract(String path) async {
+    try {
+      final result = await Process.run('ffprobe', [
+        '-v',
+        'error',
+        '-show_entries',
+        'format_tags=artist,album,genre,date,comment,track',
+        '-show_entries',
+        'format=duration,bit_rate',
+        '-of',
+        'json',
+        path,
+      ]);
+      if (result.exitCode != 0) return {};
+      final json = jsonDecode(result.stdout as String) as Map<String, dynamic>?;
+      if (json == null) return {};
+      final tags = json['format']?['tags'] as Map<String, dynamic>?;
+      final duration = double.tryParse(
+        json['format']?['duration']?.toString() ?? '',
+      );
+      final bitRate = int.tryParse(
+        json['format']?['bit_rate']?.toString() ?? '',
+      );
+      return {
+        'Artist': tags?['artist']?.toString(),
+        'Album': tags?['album']?.toString(),
+        'Genre': tags?['genre']?.toString(),
+        'Year': tags?['date']?.toString(),
+        'Track': tags?['track']?.toString(),
+        'Comment': tags?['comment']?.toString(),
+        'Duration': duration != null ? _fmtDuration(duration) : null,
+        'Bitrate': bitRate != null ? '${(bitRate / 1000).round()} kbps' : null,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  String _fmtDuration(double secs) {
+    final d = Duration(milliseconds: (secs * 1000).round());
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60);
+    final s = d.inSeconds.remainder(60);
+    if (h > 0)
+      return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return FutureBuilder<Map<String, String?>>(
+      future: _future,
+      builder: (context, snapshot) {
+        final data = snapshot.data;
+        if (data == null || data.isEmpty) return const SizedBox.shrink();
+
+        final items = data.entries
+            .where((e) => e.value != null && e.value!.isNotEmpty)
+            .toList();
+        if (items.isEmpty) return const SizedBox.shrink();
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: cs.surfaceContainerHighest.withAlpha(80),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: cs.outlineVariant.withAlpha(60),
+              width: 2,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.audio_file, size: 16, color: cs.onSurfaceVariant),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Audio Metadata',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 16,
+                runSpacing: 6,
+                children: items
+                    .map(
+                      (e) => SizedBox(
+                        width: 220,
+                        child: _buildRow(context, e.key, e.value!),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRow(BuildContext context, String label, String value) {
+    final cs = Theme.of(context).colorScheme;
+    return Row(
+      children: [
+        SelectableText(
+          '$label: ',
+          style: TextStyle(
+            fontSize: 11,
+            color: cs.onSurfaceVariant.withAlpha(180),
+            overflow: TextOverflow.fade,
+          ),
+        ),
+        Expanded(
+          child: SelectableText(
+            value,
+            style: TextStyle(
+              fontSize: 11,
+              color: cs.onSurface,
+              fontWeight: FontWeight.w500,
+              overflow: TextOverflow.fade,
+            ),
+            maxLines: 1,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _PreviewContent extends StatelessWidget {
   const _PreviewContent({required this.file});
 
@@ -730,7 +918,7 @@ class _MediaPreviewState extends State<_MediaPreview> {
                     color: Colors.black26,
                     child: const Center(
                       child: Icon(
-                        Icons.play_circle_outline_rounded,
+                        Icons.play_arrow_rounded,
                         color: Colors.white70,
                         size: 64,
                       ),

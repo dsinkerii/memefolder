@@ -49,6 +49,10 @@ dependencies:
   just_audio_media_kit: ^2.1.0
   open_dir: ^0.0.2+1
   open_file: ^4.0.0
+  sqflite: ^2.4.2+1
+  path: ^1.9.1
+  sqflite_common_ffi: any
+
 
 
 dev_dependencies:
@@ -72,6 +76,7 @@ flutter:
 
   assets:
     - Assets/Images/
+    - Assets/SFX/
   fonts:
     - family: AlbertSans
       fonts:
