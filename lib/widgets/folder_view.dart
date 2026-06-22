@@ -5,6 +5,8 @@ import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gradient_borders/gradient_borders.dart';
+import 'package:memefolder/backend/indexer.dart';
+import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:silky_scroll/silky_scroll.dart';
 
@@ -188,13 +190,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       }
     }
     return false;
-  }
-
-  void _refreshDirectory() {
-    setState(() {
-      _entitiesFuture = Directory(widget.currentPath).list().toList();
-    });
-    widget.onRefresh();
   }
 
   void _handleItemPointerDown(FileSystemEntity entity, bool isDir) {
@@ -414,16 +409,20 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           backgroundColor: WidgetStatePropertyAll(cs.primary),
           padding: WidgetStatePropertyAll(.all(16)),
         ),
-        onPressed: _refreshDirectory,
+        onPressed: indexDirectory,
         child: Row(
           mainAxisSize: .min,
           spacing: 10,
           children: [
-            Icon(Icons.refresh, color: cs.surface, size: 26),
+            Icon(
+              Icons.refresh,
+              color: readableOn(Theme.of(context).colorScheme.primary),
+              size: 26,
+            ),
             Text(
-              "Index",
+              "index",
               maxLines: 1,
-              style: TextStyle(color: cs.surface, fontSize: 18),
+              style: TextStyle(color: readableOn(cs.primary), fontSize: 18),
             ),
             SizedBox(width: 4),
           ],
@@ -926,9 +925,11 @@ class _SuggestionsPopupState extends State<_SuggestionsPopup>
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    for (var index = 0;
-                        index < widget.suggestions.length;
-                        index++)
+                    for (
+                      var index = 0;
+                      index < widget.suggestions.length;
+                      index++
+                    )
                       _buildItem(context, index, cs),
                   ],
                 ),

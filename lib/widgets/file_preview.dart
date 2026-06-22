@@ -10,9 +10,12 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:memefolder/backend/audio_player_service.dart';
 import 'package:memefolder/backend/waveform_generator.dart';
+import 'package:memefolder/prefs.dart';
+import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:open_dir/open_dir.dart';
 import 'package:open_file/open_file.dart';
+import 'package:silky_scroll/silky_scroll.dart';
 
 class FilePreviewPane extends StatelessWidget {
   const FilePreviewPane({super.key, required this.file});
@@ -26,6 +29,7 @@ class FilePreviewPane extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
+        scrolledUnderElevation: 0,
         backgroundColor: Theme.of(
           context,
         ).colorScheme.surfaceContainerHighest.withAlpha(110),
@@ -44,43 +48,50 @@ class FilePreviewPane extends StatelessWidget {
           maxLines: 1,
         ),
       ),
-      body: SingleChildScrollView(
-        child: Center(
-          child: Container(
-            margin: const EdgeInsets.all(16),
-            padding: .all(16),
-            constraints: const BoxConstraints(maxWidth: 900),
-            decoration: BoxDecoration(
-              color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: cs.outlineVariant),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(
-                  child: AspectRatio(
-                    aspectRatio: 16 / 10,
-                    child: currentFile == null
-                        ? Icon(
-                            Icons.insert_drive_file,
-                            size: 64,
-                            color: cs.onSurfaceVariant,
-                          )
-                        : _PreviewContent(file: currentFile),
+      body: SilkyScroll(
+        builder: (context, controller, physics, pointerDeviceKind) =>
+            SingleChildScrollView(
+              controller: controller,
+              child: Center(
+                child: Container(
+                  margin: const EdgeInsets.all(16),
+                  padding: .all(16),
+                  constraints: const BoxConstraints(maxWidth: 900),
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: cs.outlineVariant.withAlpha(160),
+                      width: 1.8,
+                    ),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: AspectRatio(
+                          aspectRatio: 16 / 10,
+                          child: currentFile == null
+                              ? Icon(
+                                  Icons.insert_drive_file,
+                                  size: 64,
+                                  color: cs.onSurfaceVariant,
+                                )
+                              : _PreviewContent(file: currentFile),
+                        ),
+                      ),
+                      if (currentFile != null) ...[
+                        const SizedBox(height: 12),
+                        _FileActionButtons(file: currentFile),
+                        const SizedBox(height: 12),
+                        _FileMetadataSection(file: currentFile),
+                      ],
+                    ],
                   ),
                 ),
-                if (currentFile != null) ...[
-                  const SizedBox(height: 12),
-                  _FileActionButtons(file: currentFile),
-                  const SizedBox(height: 12),
-                  _FileMetadataSection(file: currentFile),
-                ],
-              ],
+              ),
             ),
-          ),
-        ),
       ),
     );
   }
@@ -104,14 +115,18 @@ class _FileActionButtons extends StatelessWidget {
   }
 
   Future<void> _copyPath(BuildContext context) async {
-    final cs = Theme.of(context).colorScheme;
     await Clipboard.setData(ClipboardData(text: file.path));
     if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('Path copied to clipboard'),
-          backgroundColor: cs.primary,
-          duration: const Duration(seconds: 1),
+      showBubble(
+        Text(
+          'path copied to clipboard',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+            decoration: TextDecoration.none,
+          ),
+          softWrap: true,
         ),
       );
     }
@@ -137,7 +152,7 @@ class _FileActionButtons extends StatelessWidget {
             icon: Icons.open_in_new,
             label: 'Open File',
             onTap: () => _openFile(context),
-            color: cs.secondary,
+            color: cs.primary,
           ),
         ),
         const SizedBox(width: 8),
@@ -146,7 +161,7 @@ class _FileActionButtons extends StatelessWidget {
             icon: Icons.copy,
             label: 'Copy Path',
             onTap: () => _copyPath(context),
-            color: cs.tertiary,
+            color: cs.primary,
           ),
         ),
       ],
@@ -398,7 +413,10 @@ class _FileMetadataSection extends StatelessWidget {
           decoration: BoxDecoration(
             color: cs.surfaceContainerHighest.withAlpha(80),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: cs.outlineVariant.withAlpha(60)),
+            border: Border.all(
+              color: cs.outlineVariant.withAlpha(60),
+              width: 2,
+            ),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -627,7 +645,7 @@ class _MediaPreview extends StatefulWidget {
 class _MediaPreviewState extends State<_MediaPreview> {
   late final Player _player;
   late final VideoController _controller;
-  double _volume = 80;
+  double _volume = PlayerPrefs.getFloat('video_volume', 80);
   bool _hovering = false;
   Timer? _hideTimer;
 
@@ -693,7 +711,11 @@ class _MediaPreviewState extends State<_MediaPreview> {
         children: [
           ColoredBox(
             color: Colors.black,
-            child: Video(controller: _controller, fit: BoxFit.contain),
+            child: Video(
+              controller: _controller,
+              fit: BoxFit.contain,
+              controls: null,
+            ),
           ),
           Positioned.fill(
             child: StreamBuilder<bool>(
@@ -800,6 +822,7 @@ class _MediaPreviewState extends State<_MediaPreview> {
                             _volume = _volume > 0 ? 0 : 80;
                           });
                           _player.setVolume(_volume);
+                          PlayerPrefs.setFloat('video_volume', _volume);
                         },
                       ),
                       Expanded(
@@ -824,6 +847,7 @@ class _MediaPreviewState extends State<_MediaPreview> {
                             onChanged: (value) {
                               setState(() => _volume = value);
                               _player.setVolume(value);
+                              PlayerPrefs.setFloat('video_volume', value);
                             },
                           ),
                         ),
@@ -1034,7 +1058,14 @@ class _AudioPreviewState extends State<_AudioPreview> {
               ],
               if (isCurrentTrack) ...[
                 const SizedBox(height: 8),
-                _buildAudioSeekBar(cs),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: _buildAudioSeekBar(cs)),
+                    const SizedBox(width: 4),
+                    _buildAudioVolumeBar(cs),
+                  ],
+                ),
               ],
             ],
           ),
@@ -1084,6 +1115,51 @@ class _AudioPreviewState extends State<_AudioPreview> {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildAudioVolumeBar(ColorScheme cs) {
+    final vol = _audio.volume;
+    return SizedBox(
+      height: 80,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            vol > 0.5
+                ? Icons.volume_up
+                : vol > 0
+                ? Icons.volume_down
+                : Icons.volume_off,
+            size: 16,
+            color: cs.onSurfaceVariant,
+          ),
+          Expanded(
+            child: RotatedBox(
+              quarterTurns: -1,
+              child: SliderTheme(
+                data: SliderThemeData(
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 5,
+                  ),
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 10,
+                  ),
+                  trackHeight: 3,
+                  activeTrackColor: cs.primary,
+                  inactiveTrackColor: cs.onSurface.withAlpha(30),
+                  thumbColor: cs.primary,
+                  overlayColor: cs.primary.withAlpha(30),
+                ),
+                child: Slider(
+                  value: vol,
+                  onChanged: (v) => _audio.setVolume(v),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

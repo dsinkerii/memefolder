@@ -5,19 +5,25 @@ import 'package:file_manager/controller/file_manager_controller.dart';
 import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/config/theme.dart';
+import 'package:memefolder/main_drawer.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/widgets/file_preview.dart';
 import 'package:memefolder/widgets/folder_view.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:provider/provider.dart';
 import 'helpers/styled_inputfields.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
   JustAudioMediaKit.ensureInitialized();
+  setNavigatorKey(navigatorKey);
   await PlayerPrefs.init();
   runApp(
     ChangeNotifierProvider(
@@ -40,8 +46,12 @@ class MyApp extends StatelessWidget {
     final theme = Provider.of<ThemeModel>(context);
     return MaterialApp(
       title: 'meme folder',
+      navigatorKey: navigatorKey,
       themeMode: theme.dark ? ThemeMode.dark : ThemeMode.light,
-      theme: buildTheme(Brightness.light, theme.accent),
+      theme: buildTheme(
+        theme.dark ? Brightness.dark : Brightness.light,
+        theme.accent,
+      ),
       home: const MyHomePage(title: 'meme folder'),
     );
   }
@@ -205,35 +215,22 @@ class _MyHomePageState extends State<MyHomePage> {
         scrolledUnderElevation: 0,
         backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
         title: Row(
-          spacing: 12,
+          spacing: 32,
           children: [
-            IconButton(onPressed: () {}, icon: Icon(Icons.menu)),
-            Expanded(
-              child: TextField(
-                decoration: newInputDeco(
-                  context,
-                ).copyWith(hintText: "context..."),
-                style: newInputStyle(context).copyWith(
-                  fontFamily: "Syne",
-                  fontVariations: [
-                    FontVariation('wdth', 2800),
-                    FontVariation('wght', 600),
-                  ],
-                ),
-              ),
-            ),
+            Expanded(child: contextBar(context)),
             FloatingActionButton(
               mini: true,
               onPressed: () {},
               child: Icon(
                 Icons.search,
                 size: 28,
-                color: Theme.of(context).colorScheme.surface,
+                color: readableOn(Theme.of(context).colorScheme.primary),
               ),
             ),
           ],
         ),
       ),
+      drawer: buildDrawer(context),
       body: MultiSplitViewTheme(
         data: MultiSplitViewThemeData(dividerThickness: 3),
         child: MultiSplitView(
