@@ -153,6 +153,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void _applyFilter() {
     final text = searchController.text.trim();
     FilterService.instance.setQuery(text);
+    // _getFilteredEntities in folder_view handles semantic + tag AND logic
   }
 
   @override

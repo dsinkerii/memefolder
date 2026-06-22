@@ -1,6 +1,10 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:memefolder/backend/indexer.dart';
+import 'package:memefolder/backend/semantic_search/cosine_search.dart';
+import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart';
+import 'package:memefolder/backend/semantic_service.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -225,21 +229,87 @@ Future<Set<String>> executeFilter(String rootPath, FilterExpr expr) async {
   }
 }
 
+/// Detect if a query has any plain text (for semantic search).
+/// Returns true if the query has at least one text token with content.
+bool queryHasSemanticText(String query) {
+  final trimmed = query.trim();
+  if (trimmed.isEmpty) return false;
+  final tokens = tokenize(trimmed);
+  return tokens.any(
+    (t) =>
+        (t.type is TokText || t.type is TokSemanticText) &&
+        t.value.trim().isNotEmpty,
+  );
+}
+
+/// Detect if a query has any tag tokens (for tag filtering).
+bool hasTagTokens(String query) {
+  final trimmed = query.trim();
+  if (trimmed.isEmpty) return false;
+  final tokens = tokenize(trimmed);
+  return tokens.any(
+    (t) =>
+        t.type is TokTagFiletype ||
+        t.type is TokTagFileext ||
+        t.type is TokTagFolder,
+  );
+}
+
+/// Legacy: returns true if query is pure semantic (no tags at all).
+bool isSemanticQuery(String query) {
+  if (!queryHasSemanticText(query)) return false;
+  return !hasTagTokens(query);
+}
+
+/// Extract the text portions from a semantic query (for embedding).
+String extractSemanticText(String query) {
+  final tokens = tokenize(query.trim());
+  return tokens
+      .where(
+        (t) =>
+            (t.type is TokText || t.type is TokSemanticText) &&
+            t.value.trim().isNotEmpty,
+      )
+      .map((t) => t.value.trim())
+      .join(' ');
+}
+
+/// Extract minScore override from @score tag (e.g. @score>0.3, @score>=0.2).
+/// Returns null if no @score tag present.
+double? extractMinScore(String query) {
+  final tokens = tokenize(query.trim());
+  for (final tok in tokens) {
+    if (tok.type is TokTagLogical && tok.value.startsWith('@score')) {
+      final val = tok.value.substring(6); // strip @score
+      final numStr = val.replaceFirst(RegExp(r'^[><=]+'), '');
+      return double.tryParse(numStr);
+    }
+  }
+  return null;
+}
+
 class FilterService extends ChangeNotifier {
   static final instance = FilterService._();
   FilterService._();
 
   String _query = '';
   FilterExpr? _expression;
+  bool _hasSemanticText = false;
+  List<CosineResult> _semanticResults = [];
 
   String get query => _query;
   FilterExpr? get expression => _expression;
-  bool get isActive => _expression != null;
+  bool get hasSemanticText => _hasSemanticText;
+  bool get hasTags => _expression != null;
+  bool get isActive => _expression != null || _hasSemanticText;
+  List<CosineResult> get semanticResults => _semanticResults;
 
   void setQuery(String query) {
     if (_query == query) return;
     _query = query;
+    _hasSemanticText = queryHasSemanticText(query);
     _expression = query.trim().isEmpty ? null : parseFilterExpression(query);
+    _semanticResults = [];
     notifyListeners();
   }
 
@@ -248,5 +318,83 @@ class FilterService extends ChangeNotifier {
   Future<Set<String>> execute(String rootPath) async {
     if (_expression == null) return {};
     return executeFilter(rootPath, _expression!);
+  }
+
+  /// Execute semantic search if query has text content.
+  Future<List<CosineResult>> executeSemantic(
+    String rootPath, {
+    int topK = 50,
+  }) async {
+    if (!_hasSemanticText || _query.trim().isEmpty) return [];
+
+    final text = extractSemanticText(_query);
+    if (text.isEmpty) return [];
+
+    final overrideMinScore = extractMinScore(_query);
+    debugPrint(
+      '[semantic] executeSemantic rootPath=$rootPath query="$text" minScore=${overrideMinScore ?? 0.65}',
+    );
+
+    try {
+      final modelDir = findModelDir();
+      if (modelDir == null) {
+        debugPrint('[semantic] modelDir is null - no model installed');
+        return [];
+      }
+      debugPrint('[semantic] modelDir=$modelDir');
+
+      // read manifest for score calibration
+      final manifest = ModelManifest.fromDir(modelDir);
+      final scale = manifest?.scoreScale ?? 1.0;
+      final bias = manifest?.scoreBias ?? 0.0;
+      debugPrint('[semantic] score calibration: scale=$scale, bias=$bias');
+
+      final config = SemanticSearchConfig(
+        activeModel: EmbeddingModelKind.clipVitB32,
+        models: {
+          EmbeddingModelKind.clipVitB32: ModelInstallInfo(
+            kind: EmbeddingModelKind.clipVitB32,
+            name: 'CLIP ViT-B/32',
+            installed: true,
+            enabled: true,
+            modelDir: modelDir,
+          ),
+        },
+      );
+
+      final service = SemanticSearchService(config);
+      await service.initialize();
+
+      if (!service.isReady) {
+        debugPrint('[semantic] service not ready after initialize');
+        return [];
+      }
+      debugPrint('[semantic] service ready, searching...');
+
+      final results = await service.search(
+        rootPath,
+        text,
+        topK: topK,
+        minScore: overrideMinScore ?? 0.65,
+        scoreScale: scale,
+        scoreBias: bias,
+      );
+      debugPrint('[semantic] search returned ${results.length} results');
+      for (final r in results.take(5)) {
+        debugPrint('[semantic]   ${r.score.toStringAsFixed(3)} ${r.filePath}');
+      }
+      await service.backend?.dispose();
+
+      _semanticResults = results;
+      return results;
+    } catch (e) {
+      debugPrint('[semantic] ERROR: $e');
+      return [];
+    }
+  }
+
+  /// Get semantic results as file paths for filtering.
+  Set<String> semanticResultPaths() {
+    return _semanticResults.map((r) => r.filePath).toSet();
   }
 }

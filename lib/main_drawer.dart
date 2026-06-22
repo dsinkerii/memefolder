@@ -3,6 +3,7 @@ import 'package:flutter_vector_icons/flutter_vector_icons.dart';
 import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/custom_tags_dialog.dart';
+import 'package:memefolder/widgets/runtime_manager.dart';
 import 'package:provider/provider.dart';
 
 Widget buildDrawer(BuildContext context) {
@@ -32,7 +33,7 @@ Widget buildDrawer(BuildContext context) {
           title: Text("runtime manager"),
           onTap: () {
             Navigator.of(context).pop();
-            showCustomTagsDialog(context);
+            showRuntimeManagerDialog(context);
           },
         ),
       ],

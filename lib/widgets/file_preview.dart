@@ -6,10 +6,12 @@ import 'dart:ui';
 import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_vector_icons/flutter_vector_icons.dart';
 import 'package:intl/intl.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:memefolder/backend/audio_player_service.dart';
+import 'package:memefolder/backend/indexer.dart';
 import 'package:memefolder/backend/waveform_generator.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
@@ -88,7 +90,11 @@ class FilePreviewPane extends StatelessWidget {
                         const SizedBox(height: 12),
                         _FileMetadataSection(file: currentFile),
                         const SizedBox(height: 12),
+                        _TagsSection(file: currentFile),
+                        const SizedBox(height: 12),
                         _AudioMetadataSection(file: currentFile),
+                        const SizedBox(height: 12),
+                        _EmbeddingSection(file: currentFile),
                       ],
                     ],
                   ),
@@ -685,6 +691,406 @@ class _AudioMetadataSectionState extends State<_AudioMetadataSection> {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _EmbeddingSection extends StatefulWidget {
+  const _EmbeddingSection({required this.file});
+  final File file;
+
+  @override
+  State<_EmbeddingSection> createState() => _EmbeddingSectionState();
+}
+
+class _EmbeddingSectionState extends State<_EmbeddingSection> {
+  late Future<Map<String, dynamic>?> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _loadEmbedding();
+  }
+
+  @override
+  void didUpdateWidget(covariant _EmbeddingSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.path != widget.file.path) {
+      _future = _loadEmbedding();
+    }
+  }
+
+  Future<Map<String, dynamic>?> _loadEmbedding() async {
+    final root = PlayerPrefs.getString("main_folder");
+    if (root.isEmpty) return null;
+    final relPath = widget.file.path;
+    // make relative to root
+    if (!relPath.startsWith(root)) return null;
+    final rel = relPath.substring(root.length + 1);
+    return getEmbeddingInfo(root, rel);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return FutureBuilder<Map<String, dynamic>?>(
+      future: _future,
+      builder: (context, snapshot) {
+        final data = snapshot.data;
+        if (data == null) return const SizedBox.shrink();
+
+        final modality = data['modality'] as String? ?? '?';
+        final model = data['model'] as String? ?? '?';
+        final dims = data['dims'] as int? ?? 0;
+        final hint = data['hint'] as String?;
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: cs.surfaceContainerHighest.withAlpha(80),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: cs.outlineVariant.withAlpha(60),
+              width: 2,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    MaterialCommunityIcons.brain,
+                    size: 16,
+                    color: cs.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Embedding',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.primary,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _buildEmbeddingRow(context, 'Modality', modality),
+              _buildEmbeddingRow(context, 'Model', model),
+              _buildEmbeddingRow(context, 'Dimensions', '$dims'),
+              if (hint != null && hint.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  'Text used for embedding:',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: cs.onSurfaceVariant.withAlpha(180),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: SelectableText(
+                    hint,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontFamily: "Hack",
+                      color: cs.onSurface,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildEmbeddingRow(BuildContext context, String label, String value) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        children: [
+          SelectableText(
+            '$label: ',
+            style: TextStyle(
+              fontSize: 11,
+              color: cs.onSurfaceVariant.withAlpha(180),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: TextStyle(
+                fontSize: 11,
+                color: cs.onSurface,
+                fontWeight: FontWeight.w500,
+              ),
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TagsSection extends StatefulWidget {
+  const _TagsSection({required this.file});
+  final File file;
+
+  @override
+  State<_TagsSection> createState() => _TagsSectionState();
+}
+
+class _TagsSectionState extends State<_TagsSection> {
+  late Future<List<String>> _future;
+  bool _adding = false;
+  final _controller = TextEditingController();
+  List<String> _allTags = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TagsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.path != widget.file.path) {
+      _load();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _load() {
+    final root = PlayerPrefs.getString("main_folder");
+    if (root.isEmpty) {
+      _future = Future.value([]);
+      return;
+    }
+    _future = getFileTags(root, widget.file.path);
+    getAvailableTags(root).then((t) {
+      if (mounted) setState(() => _allTags = t);
+    });
+  }
+
+  Future<void> _addTag(String tag) async {
+    final root = PlayerPrefs.getString("main_folder");
+    if (root.isEmpty) return;
+    await addFileTag(root, widget.file.path, tag);
+    _controller.clear();
+    setState(() {
+      _adding = false;
+      _load();
+    });
+  }
+
+  Future<void> _removeTag(String tag) async {
+    final root = PlayerPrefs.getString("main_folder");
+    if (root.isEmpty) return;
+    await removeFileTag(root, widget.file.path, tag);
+    _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return FutureBuilder<List<String>>(
+      future: _future,
+      builder: (context, snapshot) {
+        final tags = snapshot.data ?? [];
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: cs.surfaceContainerHighest.withAlpha(80),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: cs.outlineVariant.withAlpha(60),
+              width: 2,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    MaterialCommunityIcons.tag_outline,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Tags',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (tags.isEmpty && !_adding)
+                Text(
+                  'no tags assigned',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: cs.onSurfaceVariant.withAlpha(150),
+                    fontStyle: FontStyle.italic,
+                  ),
+                )
+              else ...[
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    ...tags.map((tag) => _buildTagChip(tag)),
+                    if (_adding) _buildAddField(),
+                  ],
+                ),
+              ],
+              if (!_adding)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: GestureDetector(
+                    onTap: () => setState(() => _adding = true),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.add,
+                          size: 14,
+                          color: cs.primary.withAlpha(180),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'add tag',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: cs.primary.withAlpha(180),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildTagChip(String tag) {
+    final cs = Theme.of(context).colorScheme;
+    return Chip(
+      label: Text(
+        tag,
+        style: TextStyle(
+          fontSize: 11,
+          color: cs.onPrimaryContainer,
+          fontFamily: "Hack",
+        ),
+      ),
+      side: BorderSide(color: cs.primary.withAlpha(160), width: 1.2),
+      backgroundColor: cs.primaryContainer,
+      deleteIcon: Icon(Icons.close, size: 14, color: cs.onPrimaryContainer),
+      onDeleted: () => _removeTag(tag),
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+    );
+  }
+
+  Widget _buildAddField() {
+    final cs = Theme.of(context).colorScheme;
+
+    return Autocomplete<String>(
+      optionsBuilder: (textEditingValue) {
+        final query = textEditingValue.text.toLowerCase();
+        if (query.isEmpty) return _allTags;
+        return _allTags.where((t) => t.toLowerCase().contains(query));
+      },
+      onSelected: (tag) {
+        _controller.text = tag;
+        _addTag(tag);
+      },
+      fieldViewBuilder: (context, controller, focusNode, onSubmitted) {
+        controller.text = _controller.text;
+        controller.selection = _controller.selection;
+        return SizedBox(
+          width: 140,
+          height: 28,
+          child: TextField(
+            controller: controller,
+            focusNode: focusNode,
+            style: TextStyle(fontSize: 11, fontFamily: "Hack"),
+            decoration: InputDecoration(
+              hintText: 'tag name...',
+              hintStyle: TextStyle(
+                fontSize: 11,
+                color: cs.onSurfaceVariant.withAlpha(120),
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 8,
+                vertical: 4,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(4),
+              ),
+              isDense: true,
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    padding: EdgeInsets.zero,
+                    constraints: BoxConstraints(),
+                    icon: Icon(Icons.close, size: 14),
+                    onPressed: () => setState(() => _adding = false),
+                  ),
+                  IconButton(
+                    padding: EdgeInsets.zero,
+                    constraints: BoxConstraints(),
+                    icon: Icon(Icons.check, size: 14),
+                    onPressed: () {
+                      final val = controller.text.trim();
+                      if (val.isNotEmpty) _addTag(val);
+                    },
+                  ),
+                ],
+              ),
+            ),
+            onSubmitted: (v) {
+              final val = v.trim();
+              if (val.isNotEmpty) _addTag(val);
+            },
+          ),
+        );
+      },
     );
   }
 }

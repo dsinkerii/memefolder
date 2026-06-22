@@ -5,7 +5,9 @@ import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gradient_borders/gradient_borders.dart';
+import 'package:memefolder/backend/download_manager.dart';
 import 'package:memefolder/backend/indexer.dart';
+import 'package:memefolder/backend/semantic_search/cosine_search.dart';
 import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
@@ -57,12 +59,16 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   DateTime? _lastPressedAt;
   late Future<List<FileSystemEntity>> _entitiesFuture;
   late Future<Set<String>> _indexedFilesFuture;
+  late Future<Map<String, String>> _embeddingFailuresFuture;
   final Map<String, Future<File?>> _videoThumbnailFutures = {};
   ValueNotifier<bool> isReindexing = ValueNotifier(false);
   ValueNotifier<double> indexProgress = ValueNotifier(0.0);
   CancellationToken? _cancelToken;
 
-  // Autocomplete state
+  // scores from semantic search (path -> 0.0–1.0)
+  Map<String, double> _semanticScores = {};
+
+  // autocomplete state
   List<String> _suggestions = [];
   int _selectedSuggestionIndex = -1;
   final LayerLink _pathBarLink = LayerLink();
@@ -89,8 +95,12 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   }
 
   Future<void> _loadData() async {
-    if (FilterService.instance.isActive) {
-      final root = PlayerPrefs.getString("main_folder");
+    final isActive = FilterService.instance.isActive;
+    final root = PlayerPrefs.getString("main_folder");
+    debugPrint(
+      '[folder] _loadData isActive=$isActive root="$root" path="${widget.currentPath}"',
+    );
+    if (isActive) {
       if (root.isNotEmpty) {
         _entitiesFuture = _getFilteredEntities(root);
       } else {
@@ -100,11 +110,60 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       _entitiesFuture = Directory(widget.currentPath).list().toList();
     }
     _indexedFilesFuture = getIndexedFiles(widget.currentPath);
+    _embeddingFailuresFuture = getEmbeddingFailures(widget.currentPath);
   }
 
   Future<List<FileSystemEntity>> _getFilteredEntities(String rootPath) async {
-    final paths = await FilterService.instance.execute(rootPath);
-    return paths.map((p) => File(p)).toList();
+    final filter = FilterService.instance;
+    debugPrint(
+      '[folder] _getFilteredEntities hasSemantic=${filter.hasSemanticText} hasTags=${filter.hasTags}',
+    );
+
+    final hasText = filter.hasSemanticText;
+    final hasTagFilter = filter.hasTags;
+
+    if (!hasText && !hasTagFilter) {
+      _semanticScores = {};
+      return [];
+    }
+
+    Set<String> tagPaths = {};
+    if (hasTagFilter) {
+      tagPaths = await filter.execute(rootPath);
+      debugPrint('[folder] tag filter returned ${tagPaths.length} paths');
+    }
+
+    List<CosineResult> semanticResults = [];
+    if (hasText) {
+      semanticResults = await filter.executeSemantic(rootPath);
+      debugPrint(
+        '[folder] semantic search returned ${semanticResults.length} results',
+      );
+    }
+
+    // both present: AND - intersect
+    if (hasText && hasTagFilter) {
+      debugPrint(
+        '[folder] AND mode: intersecting ${semanticResults.length} semantic × ${tagPaths.length} tag paths',
+      );
+      final matched = semanticResults
+          .where((r) => tagPaths.contains(r.filePath))
+          .toList();
+      _semanticScores = {for (final r in matched) r.filePath: r.score};
+      final files = matched.map((r) => File(r.filePath)).toList();
+      debugPrint('[folder] intersection: ${files.length} files');
+      return files;
+    }
+
+    // semantic only - already sorted by score from cosineSearch
+    if (hasText) {
+      _semanticScores = {for (final r in semanticResults) r.filePath: r.score};
+      return semanticResults.map((r) => File(r.filePath)).toList();
+    }
+
+    // tag only
+    _semanticScores = {};
+    return tagPaths.map((p) => File(p)).toList();
   }
 
   @override
@@ -358,206 +417,252 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           future: _entitiesFuture,
           builder: (context, entitiesSnapshot) => FutureBuilder<Set<String>>(
             future: _indexedFilesFuture,
-            builder: (context, indexedSnapshot) => SilkyScroll(
-              builder: (context, controller, physics, pointerDeviceKind) {
-                if (entitiesSnapshot.hasError) {
-                  return Center(
-                    child: Text("Error: ${entitiesSnapshot.error}"),
-                  );
-                }
-                if (!entitiesSnapshot.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                final entities =
-                    entitiesSnapshot.data!
-                        .where((e) => !FileManager.basename(e).startsWith('.'))
-                        .toList()
-                      ..sort((a, b) {
-                        final aIsDir = FileManager.isDirectory(a);
-                        final bIsDir = FileManager.isDirectory(b);
-                        if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-                        return FileManager.basename(a).toLowerCase().compareTo(
-                          FileManager.basename(b).toLowerCase(),
+            builder: (context, indexedSnapshot) =>
+                FutureBuilder<Map<String, String>>(
+                  future: _embeddingFailuresFuture,
+                  builder: (context, failuresSnapshot) => SilkyScroll(
+                    builder: (context, controller, physics, pointerDeviceKind) {
+                      if (entitiesSnapshot.hasError) {
+                        return Center(
+                          child: Text("Error: ${entitiesSnapshot.error}"),
                         );
-                      });
+                      }
+                      if (!entitiesSnapshot.hasData) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
 
-                final isFiltering = FilterService.instance.isActive;
+                      final entities =
+                          entitiesSnapshot.data!
+                              .where(
+                                (e) => !FileManager.basename(e).startsWith('.'),
+                              )
+                              .toList()
+                            ..sort((a, b) {
+                              final aIsDir = FileManager.isDirectory(a);
+                              final bIsDir = FileManager.isDirectory(b);
+                              if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
 
-                if (entities.isEmpty) {
-                  if (isFiltering) {
-                    final root = PlayerPrefs.getString("main_folder");
-                    final dbExists =
-                        root.isNotEmpty &&
-                        File('$root/.memefolder.db').existsSync();
-                    return Center(
-                      child: Text(
-                        dbExists
-                            ? "no results"
-                            : "(!) please index directory to enable search (!)",
-                      ),
-                    );
-                  }
-                  return const Center(child: Text("Empty Directory"));
-                }
+                              // sort by semantic score when available
+                              if (_semanticScores.isNotEmpty) {
+                                final aScore = _semanticScores[a.path] ?? 0.0;
+                                final bScore = _semanticScores[b.path] ?? 0.0;
+                                return bScore.compareTo(aScore);
+                              }
 
-                final indexedFiles = indexedSnapshot.data ?? {};
-                final zoom = 0.75 + (widget.folderScale * 1.25);
-                final listColumns = 1 + (widget.folderScale * 3).round();
-                final gridCellWidth = 88.0 * zoom;
-                final gridCellHeight = 120.0 * zoom;
-                final iconSize = 44.0 * zoom;
-                final listRowHeight = 52.0 * zoom;
-                final listIconSize = 28.0 * zoom;
-                final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
+                              return FileManager.basename(
+                                a,
+                              ).toLowerCase().compareTo(
+                                FileManager.basename(b).toLowerCase(),
+                              );
+                            });
 
-                if (widget.isGrid) {
-                  return GridView.builder(
-                    padding: const EdgeInsets.all(8),
-                    controller: controller,
-                    gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: gridCellWidth,
-                      mainAxisExtent: gridCellHeight,
-                      mainAxisSpacing: 8,
-                      crossAxisSpacing: 8,
-                    ),
-                    itemCount: entities.length,
-                    itemBuilder: (context, index) {
-                      final e = entities[index];
-                      final isDir = FileManager.isDirectory(e);
-                      return _buildGridTile(
-                        context: context,
-                        isDir: isDir,
-                        entity: e,
-                        isHovered: _hoveredPath == e.path,
-                        isSelected: _selectedPath == e.path,
-                        isIndexed:
-                            !isDir &&
-                            (isFiltering || indexedFiles.contains(e.path)),
-                        iconSize: iconSize,
-                        gridWidth: gridCellWidth,
-                        labelSize: labelSize,
-                      );
+                      final isFiltering = FilterService.instance.isActive;
+
+                      if (entities.isEmpty) {
+                        if (isFiltering) {
+                          final root = PlayerPrefs.getString("main_folder");
+                          final dbExists =
+                              root.isNotEmpty &&
+                              File('$root/.memefolder.db').existsSync();
+                          return Center(
+                            child: Text(
+                              dbExists
+                                  ? "no results"
+                                  : "(!) please index directory to enable search (!)",
+                            ),
+                          );
+                        }
+                        return const Center(child: Text("Empty Directory"));
+                      }
+
+                      final indexedFiles = indexedSnapshot.data ?? {};
+                      final embeddingFailures = failuresSnapshot.data ?? {};
+                      final zoom = 0.75 + (widget.folderScale * 1.25);
+                      final listColumns = 1 + (widget.folderScale * 3).round();
+                      final gridCellWidth = 88.0 * zoom;
+                      final gridCellHeight = 120.0 * zoom;
+                      final iconSize = 44.0 * zoom;
+                      final listRowHeight = 52.0 * zoom;
+                      final listIconSize = 28.0 * zoom;
+                      final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
+
+                      if (widget.isGrid) {
+                        return GridView.builder(
+                          padding: const EdgeInsets.all(8),
+                          controller: controller,
+                          gridDelegate:
+                              SliverGridDelegateWithMaxCrossAxisExtent(
+                                maxCrossAxisExtent: gridCellWidth,
+                                mainAxisExtent: gridCellHeight,
+                                mainAxisSpacing: 8,
+                                crossAxisSpacing: 8,
+                              ),
+                          itemCount: entities.length,
+                          itemBuilder: (context, index) {
+                            final e = entities[index];
+                            final isDir = FileManager.isDirectory(e);
+                            return _buildGridTile(
+                              context: context,
+                              isDir: isDir,
+                              entity: e,
+                              isHovered: _hoveredPath == e.path,
+                              isSelected: _selectedPath == e.path,
+                              isIndexed:
+                                  !isDir &&
+                                  (isFiltering ||
+                                      indexedFiles.contains(e.path)),
+                              embedFailure: isDir
+                                  ? null
+                                  : embeddingFailures[e.path],
+                              matchScore: _semanticScores[e.path],
+                              iconSize: iconSize,
+                              gridWidth: gridCellWidth,
+                              labelSize: labelSize,
+                            );
+                          },
+                        );
+                      } else {
+                        return GridView.builder(
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: listColumns,
+                                mainAxisExtent: listRowHeight,
+                              ),
+                          controller: controller,
+                          itemCount: entities.length,
+                          itemBuilder: (context, index) {
+                            final e = entities[index];
+                            final isDir = FileManager.isDirectory(e);
+                            return _buildListTile(
+                              context: context,
+                              isDir: isDir,
+                              entity: e,
+                              isHovered: _hoveredPath == e.path,
+                              isSelected: _selectedPath == e.path,
+                              isIndexed:
+                                  !isDir &&
+                                  (isFiltering ||
+                                      indexedFiles.contains(e.path)),
+                              matchScore: _semanticScores[e.path],
+                              iconSize: listIconSize,
+                            );
+                          },
+                        );
+                      }
                     },
-                  );
-                } else {
-                  return GridView.builder(
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: listColumns,
-                      mainAxisExtent: listRowHeight,
-                    ),
-                    controller: controller,
-                    itemCount: entities.length,
-                    itemBuilder: (context, index) {
-                      final e = entities[index];
-                      final isDir = FileManager.isDirectory(e);
-                      return _buildListTile(
-                        context: context,
-                        isDir: isDir,
-                        entity: e,
-                        isHovered: _hoveredPath == e.path,
-                        isSelected: _selectedPath == e.path,
-                        isIndexed:
-                            !isDir &&
-                            (isFiltering || indexedFiles.contains(e.path)),
-                        iconSize: listIconSize,
-                      );
-                    },
-                  );
-                }
-              },
-            ),
+                  ),
+                ),
           ),
         ),
       ),
-      floatingActionButton: IconButton(
-        style: ButtonStyle(
-          backgroundColor: WidgetStatePropertyAll(cs.primary),
-          padding: WidgetStatePropertyAll(.all(16)),
-        ),
-        hoverColor: cs.primaryContainer,
-        onPressed: () async {
-          if (isReindexing.value) {
-            _cancelToken?.cancel();
-            return;
-          }
-          _cancelToken = CancellationToken();
-          isReindexing.value = true;
-          indexProgress.value = 0;
-          await indexDirectory(
-            widget.currentPath,
-            onProgress: (p) => indexProgress.value = p,
-            cancelToken: _cancelToken,
-          );
-          setState(() {
-            _indexedFilesFuture = getIndexedFiles(widget.currentPath);
-          });
-          indexProgress.value = 0;
-          isReindexing.value = false;
-        },
-        icon: ValueListenableBuilder(
-          valueListenable: isReindexing,
-          builder: (context, value, child) => AnimatedSwitcher(
-            duration: Duration(milliseconds: 500),
-            child: isReindexing.value
-                ? ValueListenableBuilder<double>(
-                    key: const ValueKey("loading"),
-                    valueListenable: indexProgress,
-                    builder: (context, progress, _) {
-                      return SizedBox(
-                        height: 36,
-                        width: 36,
-                        child: Stack(
-                          alignment: Alignment.center,
-                          children: [
-                            SizedBox(
+      floatingActionButton: Builder(
+        builder: (context) {
+          final hasModel = DownloadManager.instance.getInstalledModel() != null;
+          return Tooltip(
+            message: hasModel
+                ? 'Index folder + generate embeddings'
+                : 'Install an embedding model in Runtime Manager first',
+            child: IconButton(
+              style: ButtonStyle(
+                backgroundColor: WidgetStatePropertyAll(
+                  hasModel ? cs.primary : cs.surfaceContainerHighest,
+                ),
+                padding: WidgetStatePropertyAll(.all(16)),
+              ),
+              hoverColor: hasModel ? cs.primaryContainer : null,
+              onPressed: hasModel
+                  ? () async {
+                      if (isReindexing.value) {
+                        _cancelToken?.cancel();
+                        return;
+                      }
+                      _cancelToken = CancellationToken();
+                      isReindexing.value = true;
+                      indexProgress.value = 0;
+                      await indexDirectory(
+                        widget.currentPath,
+                        onProgress: (p) => indexProgress.value = p,
+                        cancelToken: _cancelToken,
+                      );
+                      setState(() {
+                        _indexedFilesFuture = getIndexedFiles(
+                          widget.currentPath,
+                        );
+                      });
+                      indexProgress.value = 0;
+                      isReindexing.value = false;
+                    }
+                  : null,
+              icon: ValueListenableBuilder(
+                valueListenable: isReindexing,
+                builder: (context, value, child) => AnimatedSwitcher(
+                  duration: Duration(milliseconds: 500),
+                  child: isReindexing.value
+                      ? ValueListenableBuilder<double>(
+                          key: const ValueKey("loading"),
+                          valueListenable: indexProgress,
+                          builder: (context, progress, _) {
+                            return SizedBox(
                               height: 36,
                               width: 36,
-                              child: CircularProgressIndicator(
-                                value: progress > 0 ? progress : null,
-                                color: readableOn(
-                                  Theme.of(context).colorScheme.primary,
-                                ),
-                                strokeWidth: 3,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  SizedBox(
+                                    height: 36,
+                                    width: 36,
+                                    child: CircularProgressIndicator(
+                                      value: progress > 0 ? progress : null,
+                                      color: readableOn(
+                                        Theme.of(context).colorScheme.primary,
+                                      ),
+                                      strokeWidth: 3,
+                                    ),
+                                  ),
+                                  Icon(
+                                    Icons.close,
+                                    size: 16,
+                                    color: readableOn(
+                                      Theme.of(context).colorScheme.primary,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ),
+                            );
+                          },
+                        )
+                      : Row(
+                          key: const ValueKey("idle"),
+                          mainAxisSize: .min,
+                          spacing: 10,
+                          children: [
                             Icon(
-                              Icons.close,
-                              size: 16,
+                              hasModel
+                                  ? Icons.refresh
+                                  : Icons.warning_amber_rounded,
                               color: readableOn(
-                                Theme.of(context).colorScheme.primary,
+                                hasModel ? cs.primary : cs.onSurfaceVariant,
+                              ),
+                              size: hasModel ? 26 : 22,
+                            ),
+                            Text(
+                              hasModel ? "index" : "no model",
+                              maxLines: 1,
+                              style: TextStyle(
+                                color: readableOn(
+                                  hasModel ? cs.primary : cs.onSurfaceVariant,
+                                ),
+                                fontSize: 18,
                               ),
                             ),
+                            SizedBox(width: 4),
                           ],
                         ),
-                      );
-                    },
-                  )
-                : Row(
-                    key: const ValueKey("idle"),
-                    mainAxisSize: .min,
-                    spacing: 10,
-                    children: [
-                      Icon(
-                        Icons.refresh,
-                        color: readableOn(
-                          Theme.of(context).colorScheme.primary,
-                        ),
-                        size: 26,
-                      ),
-                      Text(
-                        "index",
-                        maxLines: 1,
-                        style: TextStyle(
-                          color: readableOn(cs.primary),
-                          fontSize: 18,
-                        ),
-                      ),
-                      SizedBox(width: 4),
-                    ],
-                  ),
-          ),
-        ),
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -569,6 +674,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
+    String? embedFailure,
+    double? matchScore,
     required double iconSize,
     required double gridWidth,
     required double labelSize,
@@ -602,6 +709,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     size: iconSize * 1.35,
                     iconSize: iconSize,
                     isIndexed: isIndexed,
+                    embedFailure: embedFailure,
+                    matchScore: matchScore,
                   ),
                   const SizedBox(height: 4),
                   Expanded(
@@ -629,6 +738,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
+    double? matchScore,
     required double iconSize,
   }) {
     return MouseRegion(
@@ -653,6 +763,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 size: iconSize * 1.45,
                 iconSize: iconSize,
                 isIndexed: isIndexed,
+                matchScore: matchScore,
               ),
               title: Text(
                 FileManager.basename(entity),
@@ -671,6 +782,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required FileSystemEntity entity,
     required bool isDir,
     required bool isIndexed,
+    String? embedFailure,
+    double? matchScore,
     required double size,
     required double iconSize,
   }) {
@@ -716,6 +829,39 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
         _PreviewKind.file => Icon(Icons.insert_drive_file, size: iconSize),
       },
     );
+
+    if (embedFailure != null) {
+      return Tooltip(
+        message: embedFailure,
+        child: SizedBox.square(
+          dimension: size,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [preview, const _EmbedFailureBadge()],
+          ),
+        ),
+      );
+    }
+
+    // score bar - show on top of everything
+    if (matchScore != null && matchScore > 0) {
+      return SizedBox.square(
+        dimension: size,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            preview,
+            if (isIndexed) const _IndexedBadge(),
+            Positioned(
+              left: 4,
+              right: 4,
+              top: 4,
+              child: _ScoreBar(score: matchScore),
+            ),
+          ],
+        ),
+      );
+    }
 
     if (isIndexed) {
       return SizedBox.square(
@@ -941,6 +1087,68 @@ class _IndexedBadge extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(2),
           child: Icon(Icons.check, color: Colors.white, size: 10),
+        ),
+      ),
+    );
+  }
+}
+
+class _EmbedFailureBadge extends StatelessWidget {
+  const _EmbedFailureBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      bottom: 2,
+      right: 2,
+      child: DecoratedBox(
+        decoration: const BoxDecoration(
+          color: Colors.red,
+          shape: BoxShape.circle,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(2),
+          child: Icon(Icons.close, color: Colors.white, size: 10),
+        ),
+      ),
+    );
+  }
+}
+
+class _ScoreBar extends StatelessWidget {
+  const _ScoreBar({required this.score});
+  final double score;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = score >= 0.6
+        ? Theme.of(context).colorScheme.primary
+        : Theme.of(context).colorScheme.error;
+    return Tooltip(
+      message: '${(score * 100).toStringAsFixed(0)}% match',
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(2),
+        child: SizedBox(
+          height: 8,
+          child: Stack(
+            children: [
+              Container(
+                decoration: BoxDecoration(
+                  color: Colors.black.withAlpha(100),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              FractionallySizedBox(
+                widthFactor: score.clamp(0.0, 1.0),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: color,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

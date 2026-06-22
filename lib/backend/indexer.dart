@@ -3,10 +3,16 @@ import 'dart:io';
 import 'package:just_audio/just_audio.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/material.dart';
+import 'package:memefolder/backend/download_manager.dart';
+import 'package:memefolder/backend/custom_tags_store.dart';
+import 'package:memefolder/backend/semantic_search/embeddings.dart';
+import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart';
+import 'package:memefolder/backend/semantic_service.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
 
 final _player = AudioPlayer();
+final _warnplayer = AudioPlayer();
 
 class CancellationToken {
   bool _cancelled = false;
@@ -59,6 +65,7 @@ Future<void> indexDirectory(
 
     if (cancelToken?.isCancelled ?? false) {
       await _cleanupTmp(tmpPath);
+      _warnplayer.play();
       showBubble(
         const Row(
           mainAxisSize: MainAxisSize.min,
@@ -86,6 +93,17 @@ Future<void> indexDirectory(
     }
     await File(tmpPath).rename(dbPath);
     onProgress?.call(1.0);
+
+    // after metadata scan, auto-embed if model is installed
+    final manifest = DownloadManager.instance.getInstalledModel();
+    if (manifest != null) {
+      await embedDirectory(
+        currentPath,
+        onProgress: onProgress != null ? (p, _) => onProgress(p) : null,
+        manifest: manifest,
+        cancelToken: cancelToken,
+      );
+    }
   } catch (e) {
     await _cleanupTmp(tmpPath);
     rethrow;
@@ -124,7 +142,7 @@ Future<Set<String>> getIndexedFiles(String rootPath) async {
   if (!File(dbPath).existsSync()) return {};
 
   try {
-    final db = await openDatabase(dbPath, readOnly: true);
+    final db = await openDatabase(dbPath, singleInstance: false);
     final results = await db.rawQuery('SELECT rel_path FROM files');
     await db.close();
     return results.map((r) {
@@ -356,6 +374,9 @@ Future<void> _scanAndIndex(
     if (depth > 5) return; // cap at depth 5
     await _player.setAsset('Assets/SFX/done.mp3');
     _player.load();
+    await _warnplayer.setAsset('Assets/SFX/warning.mp3');
+    _warnplayer.load();
+
     final folderId = await ensureFolder(txn, relPath);
     final dirPath = relPath.isEmpty ? rootPath : p.join(rootPath, relPath);
 
@@ -367,7 +388,7 @@ Future<void> _scanAndIndex(
       if (cancelToken?.isCancelled ?? false) return;
       final name = p.basename(entity.path);
       if (name == '.memefolder.db' ||
-          name.startsWith('.memefolder.db-') ||
+          name.startsWith('.memefolder.db') ||
           name == '.memefolder.db.tmp') {
         continue;
       }
@@ -681,6 +702,14 @@ Future<void> _createSchema(Database db, String currentPath) async {
     CREATE INDEX idx_tags_slug ON tags(slug);
   ''');
 
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS embedding_failures (
+      file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL,
+      failed_at INTEGER NOT NULL
+    );
+  ''');
+
   await db.insert('roots', {
     'id': 1,
     'root_path': currentPath,
@@ -777,4 +806,724 @@ Future<void> _createSchema(Database db, String currentPath) async {
       'usage_count': 0,
     });
   }
+}
+
+// embedding indexer
+Future<void> embedDirectory(
+  String rootPath, {
+  void Function(double progress, String currentFile)? onProgress,
+  CancellationToken? cancelToken,
+  ModelManifest? manifest,
+}) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return;
+
+  // determine capabilities from manifest or fallback to defaults
+  final embedImages = manifest?.supportsImage ?? true;
+  final embedTexts = manifest?.supportsText ?? true;
+  final extractVideoKeyframes = manifest?.supportsImage ?? true;
+  final extractAudioKeyframes = manifest?.supportsImage ?? true;
+
+  showBubble(
+    Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const Icon(Icons.sync, color: Colors.white),
+        const SizedBox(width: 12),
+        Text(
+          manifest != null
+              ? 'indexing with ${manifest.name}...'
+              : 'generating embeddings...',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+            decoration: TextDecoration.none,
+          ),
+          softWrap: true,
+        ),
+      ],
+    ),
+  );
+
+  // locate model dir
+  final modelDir = findModelDir();
+  if (modelDir == null) {
+    return; // silently skip - no model installed
+  }
+
+  // initialize backend
+  final config = SemanticSearchConfig(
+    activeModel: EmbeddingModelKind.clipVitB32,
+    models: {
+      EmbeddingModelKind.clipVitB32: ModelInstallInfo(
+        kind: EmbeddingModelKind.clipVitB32,
+        name: 'CLIP ViT-B/32',
+        installed: true,
+        enabled: true,
+        modelDir: modelDir,
+      ),
+    },
+  );
+
+  final service = SemanticSearchService(config);
+  await service.initialize();
+
+  if (!service.isReady) {
+    return; // silently skip
+  }
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+
+    // ensure failures table exists (for old DBs)
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS embedding_failures (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        failed_at INTEGER NOT NULL
+      );
+    ''');
+
+    // clean up any DB internal files that got indexed by mistake
+    await db.execute('''
+      DELETE FROM file_embeddings WHERE file_id IN (
+        SELECT id FROM files WHERE name LIKE '.memefolder.db%'
+      );
+    ''');
+    await db.execute('''
+      DELETE FROM file_text WHERE file_id IN (
+        SELECT id FROM files WHERE name LIKE '.memefolder.db%'
+      );
+    ''');
+    await db.execute('''
+      DELETE FROM files WHERE name LIKE '.memefolder.db%'
+    ''');
+
+    // find files that don't have embeddings yet
+    final rows = await db.rawQuery('''
+      SELECT f.id, f.rel_path, f.media_type, f.name, f.stem,
+             ft.combined_text, ft.ai_description,
+             f.artist, f.album, f.genre, f.year, f.comment
+      FROM files f
+      LEFT JOIN file_text ft ON ft.file_id = f.id
+      LEFT JOIN file_embeddings fe ON fe.file_id = f.id
+      WHERE fe.file_id IS NULL
+    ''');
+
+    final totalCount = rows.length;
+    if (totalCount == 0) {
+      await db.close();
+      await service.backend?.dispose();
+      return; // all already embedded
+    }
+
+    var embeddedCount = 0;
+    var failedCount = 0;
+
+    for (final row in rows) {
+      if (cancelToken?.isCancelled ?? false) break;
+
+      final fileId = row['id'] as int;
+      final relPath = row['rel_path'] as String;
+      final mediaType = row['media_type'] as String;
+      final name = row['name'] as String;
+      final stem = row['stem'] as String;
+      final combinedText = row['combined_text'] as String?;
+      final aiDesc = row['ai_description'] as String?;
+      final artist = row['artist'] as String?;
+      final album = row['album'] as String?;
+      final genre = row['genre'] as String?;
+      final year = row['year'] as int?;
+      final comment = row['comment'] as String?;
+
+      final absPath = p.join(rootPath, relPath);
+
+      // fetch user-assigned tags for embedding context
+      final userTags = await getFileTags(rootPath, absPath);
+
+      onProgress?.call(embeddedCount / totalCount, name);
+
+      try {
+        switch (mediaType) {
+          case 'image':
+            if (embedImages) {
+              final file = File(absPath);
+              if (await file.exists()) {
+                final vec = await service.embedImageFile(file);
+                await _storeEmbedding(
+                  db,
+                  fileId,
+                  vec,
+                  'image',
+                  embeddingHint: '[image embedding]',
+                );
+              }
+            }
+            break;
+
+          case 'video':
+            // embed text context from filename + metadata
+            if (embedTexts) {
+              final textContext = _buildTextContext(
+                stem: stem,
+                name: name,
+                combinedText: combinedText,
+                aiDesc: aiDesc,
+                artist: artist,
+                album: album,
+                genre: genre,
+                year: year,
+                comment: comment,
+                tags: userTags,
+              );
+              final vec = await service.embedText(textContext);
+              await _storeEmbedding(
+                db,
+                fileId,
+                vec,
+                'text',
+                embeddingHint: textContext,
+              );
+            }
+            // extract keyframe and embed as image
+            if (extractVideoKeyframes) {
+              final keyframe = await _extractVideoKeyframe(absPath);
+              if (keyframe != null) {
+                final vec = await service.embedImageFile(keyframe);
+                await _storeEmbedding(
+                  db,
+                  fileId,
+                  vec,
+                  'image',
+                  embeddingHint: '[video keyframe embedding]',
+                );
+                await keyframe.delete();
+              }
+            }
+            break;
+
+          case 'audio':
+            // embed text context from filename + metadata
+            if (embedTexts) {
+              final textContext = _buildTextContext(
+                stem: stem,
+                name: name,
+                combinedText: combinedText,
+                aiDesc: aiDesc,
+                artist: artist,
+                album: album,
+                genre: genre,
+                year: year,
+                comment: comment,
+                tags: userTags,
+              );
+              final vec = await service.embedText(textContext);
+              await _storeEmbedding(
+                db,
+                fileId,
+                vec,
+                'text',
+                embeddingHint: textContext,
+              );
+            }
+            // extract waveform/keyframe placeholder as image
+            if (extractAudioKeyframes) {
+              final keyframe = await _extractAudioKeyframe(absPath);
+              if (keyframe != null) {
+                final vec = await service.embedImageFile(keyframe);
+                await _storeEmbedding(
+                  db,
+                  fileId,
+                  vec,
+                  'image',
+                  embeddingHint: '[audio spectrogram embedding]',
+                );
+                await keyframe.delete();
+              }
+            }
+            break;
+
+          default:
+            // unknown type: embed filename as text
+            if (embedTexts) {
+              final vec = await service.embedText(stem);
+              await _storeEmbedding(
+                db,
+                fileId,
+                vec,
+                'text',
+                embeddingHint: stem,
+              );
+            }
+        }
+        embeddedCount++;
+      } catch (e) {
+        failedCount++;
+        debugPrint('embed failed for $relPath: $e');
+        await _storeFailure(db, fileId, '$e');
+
+        // play warning and show failure bubble
+        _warnplayer.play();
+        showBubble(
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cancel, color: Colors.white),
+              const SizedBox(width: 12),
+              Flexible(
+                child: Text(
+                  '$name failed: $e',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    decoration: TextDecoration.none,
+                  ),
+                  softWrap: true,
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+
+    await db.close();
+    await service.backend?.dispose();
+
+    onProgress?.call(1.0, '');
+
+    final msg = failedCount > 0
+        ? 'embedded $embeddedCount files ($failedCount failed)'
+        : 'embedded $embeddedCount files';
+
+    showBubble(
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            failedCount > 0 ? Icons.warning : Icons.check_circle,
+            color: Colors.white,
+          ),
+          const SizedBox(width: 12),
+          Text(
+            msg,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        ],
+      ),
+    );
+  } catch (e) {
+    showBubble(
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.error, color: Colors.white),
+          const SizedBox(width: 12),
+          Text(
+            'embedding failed: $e',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> _storeEmbedding(
+  Database db,
+  int fileId,
+  EmbeddingVector vec,
+  String modality, {
+  String? embeddingHint,
+}) async {
+  final blob = SemanticSearchService.embeddingToBlob(vec);
+  await db.insert('file_embeddings', {
+    'file_id': fileId,
+    'modality': modality,
+    'model_name': 'clip-vit-b32',
+    'dims': vec.dims,
+    'embedding': blob,
+    'created_at': DateTime.now().millisecondsSinceEpoch,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
+
+  // store the text hint used for embedding in file_text.combined_text
+  if (embeddingHint != null) {
+    await db.rawUpdate(
+      '''
+      UPDATE file_text
+      SET combined_text = CASE
+        WHEN combined_text IS NULL THEN ?
+        WHEN combined_text = '' THEN ?
+        ELSE combined_text || '\n' || ?
+      END
+      WHERE file_id = ?
+    ''',
+      [embeddingHint, embeddingHint, embeddingHint, fileId],
+    );
+  }
+}
+
+Future<void> _storeFailure(Database db, int fileId, String reason) async {
+  await db.insert('embedding_failures', {
+    'file_id': fileId,
+    'reason': reason,
+    'failed_at': DateTime.now().millisecondsSinceEpoch,
+  }, conflictAlgorithm: ConflictAlgorithm.replace);
+}
+
+// get user-assigned tags for a file (returns display names like "@farticles").
+Future<List<String>> getFileTags(String rootPath, String absPath) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return [];
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+    final rows = await db.rawQuery(
+      '''
+      SELECT t.display_name
+      FROM file_tags ft
+      JOIN files f ON f.id = ft.file_id
+      JOIN tags t ON t.id = ft.tag_id
+      WHERE f.rel_path = ? AND ft.source = 'user'
+      ORDER BY t.display_name
+    ''',
+      [p.relative(absPath, from: rootPath)],
+    );
+    await db.close();
+    return rows.map((r) => r['display_name'] as String).toList();
+  } catch (e) {
+    debugPrint('[tags] getFileTags error: $e');
+    return [];
+  }
+}
+
+Future<void> addFileTag(String rootPath, String absPath, String tagName) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return;
+
+  final slug = tagName.replaceFirst('@', '').toLowerCase().trim();
+  if (slug.isEmpty) return;
+  final displayName = '@$slug';
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+
+    // ensure tag exists in tags table
+    var rows = await db.rawQuery('SELECT id FROM tags WHERE slug = ?', [slug]);
+    int tagId;
+    if (rows.isNotEmpty) {
+      tagId = rows.first['id'] as int;
+    } else {
+      tagId = await db.insert('tags', {
+        'slug': slug,
+        'display_name': displayName,
+        'kind': 'custom',
+        'created_at': DateTime.now().millisecondsSinceEpoch,
+        'usage_count': 0,
+      });
+    }
+
+    // get file id
+    final relPath = p.relative(absPath, from: rootPath);
+    rows = await db.rawQuery('SELECT id FROM files WHERE rel_path = ?', [
+      relPath,
+    ]);
+    if (rows.isEmpty) {
+      await db.close();
+      return;
+    }
+    final fileId = rows.first['id'] as int;
+
+    // attach tag
+    await db.insert('file_tags', {
+      'file_id': fileId,
+      'tag_id': tagId,
+      'source': 'user',
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+
+    // bump usage count
+    await db.rawUpdate(
+      'UPDATE tags SET usage_count = usage_count + 1 WHERE id = ?',
+      [tagId],
+    );
+
+    await db.close();
+
+    // sync to CustomTagsStore for autocomplete
+    CustomTagsStore.instance.refresh();
+  } catch (e) {
+    debugPrint('[tags] addFileTag error: $e');
+  }
+}
+
+// remove a custom tag from a file.
+Future<void> removeFileTag(
+  String rootPath,
+  String absPath,
+  String tagName,
+) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return;
+
+  final slug = tagName.replaceFirst('@', '').toLowerCase().trim();
+  if (slug.isEmpty) return;
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+
+    final relPath = p.relative(absPath, from: rootPath);
+    await db.rawDelete(
+      '''
+      DELETE FROM file_tags
+      WHERE file_id = (SELECT id FROM files WHERE rel_path = ?)
+        AND tag_id = (SELECT id FROM tags WHERE slug = ?)
+        AND source = 'user'
+    ''',
+      [relPath, slug],
+    );
+
+    await db.rawUpdate(
+      'UPDATE tags SET usage_count = MAX(0, usage_count - 1) WHERE slug = ?',
+      [slug],
+    );
+
+    await db.close();
+  } catch (e) {
+    debugPrint('[tags] removeFileTag error: $e');
+  }
+}
+
+/// get all available custom tags
+Future<List<String>> getAvailableTags(String rootPath) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  Set<String> allTags = {};
+
+  // from CustomTagsStore (user-defined)
+  allTags.addAll(CustomTagsStore.instance.tags);
+
+  // from DB (any custom tags that were created via addFileTag)
+  if (File(dbPath).existsSync()) {
+    try {
+      final db = await openDatabase(dbPath, singleInstance: false);
+      final rows = await db.rawQuery(
+        "SELECT slug FROM tags WHERE kind = 'custom'",
+      );
+      await db.close();
+      for (final r in rows) {
+        allTags.add(r['slug'] as String);
+      }
+    } catch (_) {}
+  }
+
+  final sorted = allTags.toList()..sort();
+  return sorted;
+}
+
+// get files that failed embedding, as map of absPath ->  reason.
+Future<Map<String, String>> getEmbeddingFailures(String rootPath) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return {};
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+
+    // ensure table exists (for old DBs created before this table)
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS embedding_failures (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        failed_at INTEGER NOT NULL
+      );
+    ''');
+
+    final rows = await db.rawQuery('''
+      SELECT f.rel_path, ef.reason
+      FROM embedding_failures ef
+      JOIN files f ON f.id = ef.file_id
+    ''');
+    await db.close();
+
+    return {
+      for (final r in rows)
+        p.join(rootPath, r['rel_path'] as String): r['reason'] as String,
+    };
+  } catch (e) {
+    debugPrint('Error reading embedding failures: $e');
+    return {};
+  }
+}
+
+// get embedding info for a file (for preview/debug).
+Future<Map<String, dynamic>?> getEmbeddingInfo(
+  String rootPath,
+  String relPath,
+) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return null;
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+    final rows = await db.rawQuery(
+      '''
+      SELECT fe.modality, fe.model_name, fe.dims, fe.created_at,
+             ft.combined_text, ft.ai_description
+      FROM file_embeddings fe
+      JOIN files f ON f.id = fe.file_id
+      LEFT JOIN file_text ft ON ft.file_id = f.id
+      WHERE f.rel_path = ?
+    ''',
+      [relPath],
+    );
+    await db.close();
+
+    if (rows.isEmpty) return null;
+    final row = rows.first;
+    return {
+      'modality': row['modality'],
+      'model': row['model_name'],
+      'dims': row['dims'],
+      'hint': row['combined_text'],
+      'ai_description': row['ai_description'],
+      'created_at': row['created_at'],
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+String _buildTextContext({
+  required String stem,
+  required String name,
+  String? combinedText,
+  String? aiDesc,
+  String? artist,
+  String? album,
+  String? genre,
+  int? year,
+  String? comment,
+  List<String> tags = const [],
+}) {
+  final parts = <String>['file: $stem'];
+  if (tags.isNotEmpty) parts.add('tags: ${tags.join(", ")}');
+  if (aiDesc != null && aiDesc.isNotEmpty) parts.add('description: $aiDesc');
+  if (combinedText != null && combinedText.isNotEmpty) {
+    parts.add('text: $combinedText');
+  }
+  if (artist != null && artist.isNotEmpty) parts.add('artist: $artist');
+  if (album != null && album.isNotEmpty) parts.add('album: $album');
+  if (genre != null && genre.isNotEmpty) parts.add('genre: $genre');
+  if (year != null) parts.add('year: $year');
+  if (comment != null && comment.isNotEmpty) parts.add('comment: $comment');
+  return parts.join(', ');
+}
+
+String? findModelDir() {
+  // try resolving from the executable location (works in both dev and packaged)
+  final exeDir = File(Platform.resolvedExecutable).parent;
+
+  // possible locations relative to executable
+  final candidates = <String>[];
+
+  // during flutter run: exe is in build/linux/x64/debug/
+  // project root is 4 levels up
+  candidates.add('${exeDir.path}/../../../../searchmodels/low-tier-clip');
+
+  // during packaged app: exe is in bundle/
+  // project root might be elsewhere, check common locations
+  candidates.add('${exeDir.path}/searchmodels/low-tier-clip');
+
+  // check CWD (works during flutter run from project root)
+  candidates.add('searchmodels/low-tier-clip');
+
+  // check home directory for downloaded models
+  final home = Platform.environment['HOME'] ?? '';
+  if (home.isNotEmpty) {
+    candidates.add('$home/.local/share/memefolder/models/low-tier-clip');
+  }
+
+  for (final candidate in candidates) {
+    final dir = Directory(candidate);
+    if (dir.existsSync()) {
+      // verify it has the required files
+      final visionFile = File('${dir.path}/vision_model.onnx');
+      if (visionFile.existsSync()) return dir.path;
+    }
+  }
+
+  // last resort: search upward from exe for searchmodels directory
+  var current = exeDir;
+  for (var i = 0; i < 6; i++) {
+    final smDir = Directory('${current.path}/searchmodels/low-tier-clip');
+    if (smDir.existsSync()) {
+      final visionFile = File('${smDir.path}/vision_model.onnx');
+      if (visionFile.existsSync()) return smDir.path;
+    }
+    current = current.parent;
+    if (current.path == '/') break;
+  }
+
+  return null;
+}
+
+bool isEmbeddingModelValid() => findModelDir() != null;
+
+Future<File?> _extractVideoKeyframe(String videoPath) async {
+  try {
+    final tmpDir = Directory.systemTemp.createTempSync('clip_keyframe_');
+    final outputPath = '${tmpDir.path}/frame.jpg';
+
+    final result = await Process.run('ffmpeg', [
+      '-i',
+      videoPath,
+      '-vframes',
+      '1',
+      '-q:v',
+      '2',
+      '-y',
+      outputPath,
+    ]);
+
+    if (result.exitCode == 0 && File(outputPath).existsSync()) {
+      return File(outputPath);
+    }
+    tmpDir.deleteSync(recursive: true);
+  } catch (_) {}
+  return null;
+}
+
+Future<File?> _extractAudioKeyframe(String audioPath) async {
+  // generate a simple spectrogram-like visual for audio embedding
+  try {
+    final tmpDir = Directory.systemTemp.createTempSync('clip_audio_');
+    final outputPath = '${tmpDir.path}/spectrogram.png';
+
+    final result = await Process.run('ffmpeg', [
+      '-i',
+      audioPath,
+      '-lavfi',
+      'showspectrumpic=s=224x224:mode=combined:color=intensity',
+      '-y',
+      outputPath,
+    ]);
+
+    if (result.exitCode == 0 && File(outputPath).existsSync()) {
+      return File(outputPath);
+    }
+    tmpDir.deleteSync(recursive: true);
+  } catch (_) {}
+  return null;
 }

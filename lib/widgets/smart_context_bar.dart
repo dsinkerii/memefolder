@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:memefolder/backend/custom_tags_store.dart';
+import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:memefolder/prefs.dart';
 
@@ -36,7 +37,7 @@ final List<({String tag, Color color, String label})> _allTags = [
   (tag: '@has:speech', color: Color(0xFFF36E36), label: 'modality'),
   (tag: '@has:text', color: Color(0xFFF36E36), label: 'modality'),
 
-  // folder: placeholder entries — real ones injected dynamically from workdir
+  // folder: placeholder entries - real ones injected dynamically from workdir
   (tag: '@folder:', color: Color(0xFF4EB8A0), label: 'folder'),
   (
     tag: '@folder:${PlayerPrefs.getString("main_folder")}',
@@ -78,7 +79,8 @@ final List<({Color color, String label})> _legendEntries = [
   (color: Color(0xFFF36E36), label: 'modality'),
   (color: Color(0xFFFFB30B), label: 'logical'),
   (color: Color(0xFF9436A6), label: 'custom'),
-  (color: Color(0xFF4EB8A0), label: 'folder'), // NEW
+  (color: Color(0xFF4EB8A0), label: 'folder'),
+  (color: Color(0xFF00BCD4), label: 'semantic'),
   (color: Color(0xFFAE4393), label: 'and'),
   (color: Color(0xFF8AD4E4), label: 'or'),
   (color: Color(0xFFB01B00), label: 'not'),
@@ -333,6 +335,12 @@ class _ContextBarFieldState extends State<_ContextBarField> {
     return false;
   }
 
+  void _applyFilter(String val) {
+    final text = searchController.text.trim();
+    debugPrint('[ctxbar] _applyFilter text="$text"');
+    FilterService.instance.setQuery(text);
+    // _getFilteredEntities in folder_view handles semantic + tag AND logic
+  }
   // build
 
   @override
@@ -343,6 +351,7 @@ class _ContextBarFieldState extends State<_ContextBarField> {
         focusNode: FocusNode(),
         onKeyEvent: _handleKeyEvent,
         child: TextField(
+          onSubmitted: (val) => _applyFilter(val),
           decoration: newInputDeco(context).copyWith(
             hintText: "context...",
             prefixIcon: ValueListenableBuilder(
@@ -358,6 +367,7 @@ class _ContextBarFieldState extends State<_ContextBarField> {
                         ),
                         onPressed: () {
                           widget.controller.clear();
+                          _applyFilter('');
                         },
                       )
                     : SizedBox.shrink();
@@ -470,7 +480,7 @@ List<Token> tokenize(String text) {
     } else if (match.group(10) != null) {
       type = TokTagLogical();
     } else if (match.group(11) != null) {
-      // @folder: — validate the path portion
+      // @folder: - validate the path portion
       final slug = g.substring(1); // strip @
       type = _folderPathRegex.hasMatch(slug) ? TokTagFolder() : TokTagInvalid();
     } else if (match.group(12) != null) {
@@ -489,6 +499,29 @@ List<Token> tokenize(String text) {
 
   if (cursor < text.length) {
     tokens.add(Token(TokText(), text.substring(cursor)));
+  }
+
+  // if no tag/operator tokens exist, mark all text as semantic
+  final hasTagOrOp = tokens.any(
+    (t) =>
+        t.type is TokTagFiletype ||
+        t.type is TokTagFileext ||
+        t.type is TokTagFolder ||
+        t.type is TokTagModality ||
+        t.type is TokTagLogical ||
+        t.type is TokOpAnd ||
+        t.type is TokOpOr ||
+        t.type is TokOpNot ||
+        t.type is TokOpBracket,
+  );
+
+  if (!hasTagOrOp && tokens.isNotEmpty) {
+    return tokens.map((t) {
+      if (t.type is TokText) {
+        return Token(TokSemanticText(), t.value);
+      }
+      return t;
+    }).toList();
   }
 
   return tokens;
@@ -582,6 +615,11 @@ class TokOpBracket extends TokenType {
 class TokEscaped extends TokenType {
   @override
   final TextStyle style = _squiggly(Color(0xFF6E6E7A));
+}
+
+class TokSemanticText extends TokenType {
+  @override
+  final TextStyle style = _underlined(Color(0xFF00BCD4));
 }
 
 // autocomplete popup
