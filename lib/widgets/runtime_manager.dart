@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:dotted_border/dotted_border.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_vector_icons/flutter_vector_icons.dart';
@@ -7,6 +8,7 @@ import 'package:memefolder/backend/download_manager.dart';
 import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart';
 import 'package:memefolder/backend/system_specs.dart';
 import 'package:memefolder/helpers/new_dialog.dart';
+import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 
 enum _Mode { simple, advanced }
@@ -16,7 +18,7 @@ enum _Tier { low, high }
 void showRuntimeManagerDialog(BuildContext context) {
   showScaleDialog(
     context: context,
-    width: 480,
+    width: 520,
     builder: (dialogCtx) => const _RuntimeManagerDialog(),
   );
 }
@@ -36,7 +38,12 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   bool _downloading = false;
   double _downloadProgress = 0;
   String? _downloadError;
-  ModelManifest? _installedModel;
+  List<ModelManifest> _installedModels = [];
+  bool _gpuAcceleration = true;
+  final Map<String, Set<EmbeddingTask>> _disabledTasks = {};
+  final Map<EmbeddingTask, String?> _taskModelAssignments = {};
+
+  final Set<EmbeddingTask> _allTasks = EmbeddingTask.values.toSet();
 
   static const _downloadLinks = {
     _Tier.low: {
@@ -67,13 +74,30 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   @override
   void initState() {
     super.initState();
+    _gpuAcceleration = PlayerPrefs.getBool(
+      PlayerPrefs.gpuAccelerationKey,
+      true,
+    );
     _loadSpecs();
-    _installedModel = DownloadManager.instance.getInstalledModel();
+    _reloadModels();
+  }
+
+  void _reloadModels() {
+    setState(() {
+      _installedModels = DownloadManager.instance.getInstalledModels();
+    });
   }
 
   Future<void> _loadSpecs() async {
     final specs = await SystemSpecs.detect();
     if (!mounted) return;
+    final defaultGpu = specs.supportsGpuAcceleration;
+    if (!_gpuAcceleration) {
+      _gpuAcceleration = PlayerPrefs.getBool(
+        PlayerPrefs.gpuAccelerationKey,
+        defaultGpu,
+      );
+    }
     setState(() {
       _specs = specs;
       _loadingSpecs = false;
@@ -81,18 +105,84 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     });
   }
 
+  bool _isTaskEnabled(ModelManifest model, EmbeddingTask task) {
+    final disabled = _disabledTasks[model.name];
+    return disabled == null || !disabled.contains(task);
+  }
+
+  void _toggleTask(ModelManifest model, EmbeddingTask task) {
+    setState(() {
+      final disabled = _disabledTasks.putIfAbsent(model.name, () => {});
+      if (disabled.contains(task)) {
+        disabled.remove(task);
+        if (disabled.isEmpty) _disabledTasks.remove(model.name);
+      } else {
+        disabled.add(task);
+      }
+    });
+  }
+
+  Set<EmbeddingTask> _coveredTasks() {
+    final covered = <EmbeddingTask>{};
+    for (final m in _installedModels) {
+      for (final t in m.tasks) {
+        if (_isTaskEnabled(m, t)) covered.add(t);
+      }
+    }
+    // also add tasks that have a manual assignment
+    for (final entry in _taskModelAssignments.entries) {
+      if (entry.value != null) covered.add(entry.key);
+    }
+    return covered;
+  }
+
+  Set<EmbeddingTask> _missingTasks() {
+    final covered = _coveredTasks();
+    return _allTasks.difference(covered);
+  }
+
   double _performanceImpact() {
     if (_specs == null) return 0.5;
     final s = _specs!;
+    final modelCount = _installedModels.length.clamp(1, 4);
     final tierRam = _tier == _Tier.high ? 8.0 : 4.0;
     final tierVram = _tier == _Tier.high ? 2.0 : 1.0;
     final tierCores = _tier == _Tier.high ? 4 : 2;
 
-    final ramRatio = tierRam / s.ramGb.clamp(0.1, 999);
-    final vramRatio = tierVram / s.vramGb.clamp(0.1, 999);
-    final coreRatio = tierCores / s.cpuCores.clamp(1, 999);
+    final ramRatio = (tierRam * modelCount) / s.ramGb.clamp(0.1, 999);
+    final vramRatio = (tierVram * modelCount) / s.vramGb.clamp(0.1, 999);
+    final coreRatio = (tierCores * modelCount) / s.cpuCores.clamp(1, 999);
 
     return ((ramRatio + vramRatio + coreRatio) / 3).clamp(0.0, 1.0);
+  }
+
+  Future<void> _toggleGpuAcceleration(bool value) async {
+    if (value && _specs != null && !_specs!.supportsGpuAcceleration) {
+      showBubble(
+        const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.warning, color: Colors.white),
+            SizedBox(width: 12),
+            Flexible(
+              child: Text(
+                'GPU acceleration requires a discrete GPU with ≥2GB VRAM',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    await PlayerPrefs.setBool(PlayerPrefs.gpuAccelerationKey, value);
+    setState(() => _gpuAcceleration = value);
   }
 
   Color _impactColor(double impact, ColorScheme cs) {
@@ -112,7 +202,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             SizedBox(width: 12),
             Text(
               'No download available for this platform',
-              style: TextStyle(color: Colors.white),
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                decoration: TextDecoration.none,
+              ),
+              softWrap: true,
             ),
           ],
         ),
@@ -146,7 +242,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               const SizedBox(width: 12),
               Text(
                 'Downloaded: ${filePath.split(Platform.pathSeparator).last}',
-                style: const TextStyle(color: Colors.white),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
               ),
             ],
           ),
@@ -163,10 +265,16 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             children: [
               const Icon(Icons.error, color: Colors.white),
               const SizedBox(width: 12),
-              Flexible(
+              Expanded(
                 child: Text(
                   'Download failed: $error',
-                  style: const TextStyle(color: Colors.white),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    decoration: TextDecoration.none,
+                  ),
+                  softWrap: true,
                 ),
               ),
             ],
@@ -183,7 +291,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               SizedBox(width: 12),
               Text(
                 'Already downloading...',
-                style: TextStyle(color: Colors.white),
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
               ),
             ],
           ),
@@ -206,7 +320,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     if (!mounted) return;
 
     if (manifest != null) {
-      setState(() => _installedModel = manifest);
+      _reloadModels();
       showBubble(
         Row(
           mainAxisSize: MainAxisSize.min,
@@ -216,7 +330,12 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             Flexible(
               child: Text(
                 'Installed: ${manifest.name}',
-                style: const TextStyle(color: Colors.white),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
                 softWrap: true,
               ),
             ),
@@ -232,8 +351,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             SizedBox(width: 12),
             Flexible(
               child: Text(
-                'Invalid model ZIP - missing package.txt or model files',
-                style: TextStyle(color: Colors.white),
+                'Invalid model ZIP - must be v2 with package.txt',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
                 softWrap: true,
               ),
             ),
@@ -243,21 +367,30 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     }
   }
 
-  Future<void> _removeModel() async {
-    final dirName = DownloadManager.instance.getInstalledModelDirName();
+  Future<void> _removeModel(ModelManifest model) async {
+    final dirName = DownloadManager.instance.getModelDirName(model);
     if (dirName == null) return;
 
     await DownloadManager.instance.removeModel(dirName);
     if (!mounted) return;
 
-    setState(() => _installedModel = null);
+    _reloadModels();
     showBubble(
       const Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(Icons.delete, color: Colors.white),
           SizedBox(width: 12),
-          Text('Model removed', style: TextStyle(color: Colors.white)),
+          Text(
+            'Model removed',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
         ],
       ),
     );
@@ -289,9 +422,9 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           ),
           const SizedBox(height: 4),
           Text(
-            "manage runtime tiers, install models, and configure hardware.",
+            "manage models, tiers, and hardware for embedding tasks.",
             style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
-            textAlign: .center,
+            textAlign: TextAlign.center,
           ),
           const SizedBox(height: 16),
           SegmentedButton<_Mode>(
@@ -352,6 +485,11 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   }
 
   Widget _buildSimpleMode(ColorScheme cs, {Key? key}) {
+    final covered = _coveredTasks();
+    final missing = _missingTasks();
+    final coveredCount = covered.length;
+    final totalCount = _allTasks.length;
+
     return Column(
       key: key,
       mainAxisSize: MainAxisSize.min,
@@ -360,10 +498,145 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
         const SizedBox(height: 12),
         _buildPerformanceBar(cs),
         const SizedBox(height: 12),
-        _buildTierSelector(cs),
+        _buildGpuToggle(cs),
+        const SizedBox(height: 12),
+        _buildSimpleModelStack(cs, covered, missing, coveredCount, totalCount),
         const SizedBox(height: 12),
         _buildDownloadSection(cs),
       ],
+    );
+  }
+
+  Widget _buildSimpleModelStack(
+    ColorScheme cs,
+    Set<EmbeddingTask> covered,
+    Set<EmbeddingTask> missing,
+    int coveredCount,
+    int totalCount,
+  ) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withAlpha(100),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.layers, size: 18, color: cs.primary),
+              const SizedBox(width: 8),
+              Text(
+                'Model Stack',
+                style: TextStyle(
+                  fontFamily: "Syne",
+                  fontVariations: const [FontVariation('wght', 600)],
+                  fontSize: 14,
+                  color: cs.onSurface,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '$coveredCount / $totalCount tasks covered',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          ..._allTasks.map((task) {
+            final hasModel = covered.contains(task);
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                children: [
+                  Icon(
+                    hasModel
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
+                    size: 16,
+                    color: hasModel ? Colors.green : cs.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    task.label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: hasModel ? cs.onSurface : cs.onSurfaceVariant,
+                    ),
+                  ),
+                  if (hasModel) ...[
+                    const SizedBox(width: 6),
+                    Text(
+                      '✓',
+                      style: TextStyle(fontSize: 11, color: Colors.green),
+                    ),
+                  ],
+                ],
+              ),
+            );
+          }),
+          if (missing.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => setState(() => _mode = _Mode.advanced),
+                icon: const Icon(MaterialIcons.colorize, size: 16),
+                label: const Text('Pick the right settings for me'),
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: cs.primary),
+                  foregroundColor: cs.primary,
+                ),
+              ),
+            ),
+          ],
+          if (_installedModels.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
+            ..._installedModels.map((m) {
+              final allDisabled = m.tasks.every((t) => !_isTaskEnabled(m, t));
+              final op = allDisabled ? 0.35 : 1.0;
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 1),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.smart_toy,
+                      size: 14,
+                      color: cs.primary.withAlpha((op * 255).round()),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        m.name,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: cs.onSurface.withAlpha((op * 255).round()),
+                          decoration: allDisabled
+                              ? TextDecoration.lineThrough
+                              : null,
+                          decorationThickness: 2.0,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text(
+                      m.tasksSummary,
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ],
+      ),
     );
   }
 
@@ -376,39 +649,168 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
         const SizedBox(height: 12),
         _buildPerformanceBar(cs),
         const SizedBox(height: 12),
-        _buildModelSection(cs),
+        _buildGpuToggle(cs),
+        const SizedBox(height: 12),
+        _buildTaskCoverage(cs),
+        const SizedBox(height: 12),
+        _buildModelList(cs),
+        const SizedBox(height: 16),
+        _buildModelUpload(cs),
       ],
     );
   }
 
-  Widget _buildModelSection(ColorScheme cs) {
-    final hasModel = _installedModel != null;
+  Widget _buildTaskCoverage(ColorScheme cs) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withAlpha(100),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: hasModel
-              ? Colors.green.withAlpha(120)
-              : cs.outlineVariant.withAlpha(60),
-          width: hasModel ? 1.5 : 1,
-        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Task Coverage',
+            style: TextStyle(
+              fontFamily: "Syne",
+              fontVariations: const [FontVariation('wght', 600)],
+              fontSize: 14,
+              color: cs.onSurface,
+            ),
+          ),
+          const SizedBox(height: 10),
+          ..._allTasks.map((task) {
+            final candidates = _installedModels
+                .where((m) => m.tasks.contains(task))
+                .toList();
+            final assigned = _taskModelAssignments[task];
+            final enabledModels = candidates.where(
+              (m) => _isTaskEnabled(m, task),
+            );
+            final hasCoverage = assigned != null
+                ? _isTaskEnabled(
+                    candidates.firstWhere(
+                      (m) => m.name == assigned,
+                      orElse: () => candidates.first,
+                    ),
+                    task,
+                  )
+                : enabledModels.isNotEmpty;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                children: [
+                  Icon(
+                    hasCoverage
+                        ? Icons.check_circle
+                        : Icons.remove_circle_outline,
+                    size: 16,
+                    color: hasCoverage ? Colors.green : cs.error,
+                  ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 120,
+                    child: Text(
+                      task.label,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: "Syne",
+                        color: hasCoverage ? cs.onSurface : cs.onSurfaceVariant,
+                        decoration: hasCoverage
+                            ? null
+                            : TextDecoration.lineThrough,
+                        decorationThickness: 2.0,
+                        decorationColor: Colors.grey,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: candidates.isEmpty
+                        ? Text(
+                            'no compatible model',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: cs.onSurfaceVariant.withAlpha(120),
+                              fontStyle: FontStyle.italic,
+                            ),
+                          )
+                        : SizedBox(
+                            height: 28,
+                            child: DropdownButtonFormField<String>(
+                              value:
+                                  assigned ??
+                                  (enabledModels.isNotEmpty
+                                      ? enabledModels.first.name
+                                      : candidates.first.name),
+                              isDense: true,
+                              isExpanded: true,
+                              decoration: const InputDecoration(
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.zero,
+                                isDense: true,
+                              ),
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: cs.onSurface,
+                                fontFamily: "Hack",
+                              ),
+                              items: candidates.map((m) {
+                                final en = _isTaskEnabled(m, task);
+                                return DropdownMenuItem<String>(
+                                  value: m.name,
+                                  enabled: en,
+                                  child: Text(
+                                    m.name,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontFamily: "Hack",
+                                      color: en
+                                          ? cs.onSurface
+                                          : cs.onSurfaceVariant.withAlpha(80),
+                                      decoration: en
+                                          ? null
+                                          : TextDecoration.lineThrough,
+                                      decorationThickness: 2.0,
+                                    ),
+                                  ),
+                                );
+                              }).toList(),
+                              onChanged: (val) {
+                                if (val != null) {
+                                  setState(
+                                    () => _taskModelAssignments[task] = val,
+                                  );
+                                }
+                              },
+                            ),
+                          ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModelList(ColorScheme cs) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withAlpha(100),
+        borderRadius: BorderRadius.circular(12),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(
-                hasModel ? Icons.smart_toy : Icons.cloud_upload,
-                size: 18,
-                color: hasModel ? Colors.green : cs.onSurfaceVariant,
-              ),
-              const SizedBox(width: 8),
               Text(
-                _installedModel!.name,
+                'Installed Models',
                 style: TextStyle(
                   fontFamily: "Syne",
                   fontVariations: const [FontVariation('wght', 600)],
@@ -417,89 +819,239 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
                 ),
               ),
               const Spacer(),
-              if (hasModel)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 2,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.green.withAlpha(30),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    'installed',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Colors.green.shade700,
-                      fontFamily: "Hack",
-                    ),
-                  ),
-                ),
+              Text(
+                '${_installedModels.length} model${_installedModels.length == 1 ? '' : 's'}',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
             ],
           ),
           const SizedBox(height: 10),
-          if (hasModel) ...[
-            _specRow(cs, Icons.category, 'Type', _installedModel!.type),
-            _specRow(
-              cs,
-              Icons.format_list_bulleted,
-              'Supports',
-              _installedModel!.supportsSummary,
-            ),
-            _specRow(cs, Icons.settings, 'Runtime', _installedModel!.runtime),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _pickAndInstallModel,
-                    icon: const Icon(Icons.refresh, size: 16),
-                    label: const Text('Replace'),
-                    style: OutlinedButton.styleFrom(
-                      side: BorderSide(color: cs.primary),
-                      foregroundColor: cs.primary,
-                    ),
+          if (_installedModels.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Center(
+                child: Text(
+                  'No models installed. Upload a model ZIP below.',
+                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                ),
+              ),
+            )
+          else
+            ..._installedModels.map((m) => _buildModelCard(cs, m)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModelCard(ColorScheme cs, ModelManifest model) {
+    final allDisabled = model.tasks.every((t) => !_isTaskEnabled(model, t));
+    final nameOpacity = allDisabled ? 0.35 : 1.0;
+    final nameDeco = allDisabled ? TextDecoration.lineThrough : null;
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: cs.surface.withAlpha(180),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: cs.primary.withAlpha(80), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.smart_toy,
+                size: 16,
+                color: cs.primary.withAlpha((nameOpacity * 255).round()),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  model.name,
+                  style: TextStyle(
+                    fontFamily: "Syne",
+                    fontVariations: const [FontVariation('wght', 600)],
+                    fontSize: 13,
+                    color: cs.onSurface.withAlpha((nameOpacity * 255).round()),
+                    decoration: nameDeco,
+                    decorationThickness: 2.0,
                   ),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _removeModel,
-                    icon: const Icon(Icons.delete_outline, size: 16),
-                    label: const Text('Remove'),
-                    style: OutlinedButton.styleFrom(
-                      side: BorderSide(color: cs.error),
-                      foregroundColor: cs.error,
-                    ),
+              ),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: cs.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  model.type,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: cs.primary,
+                    fontFamily: "Hack",
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 4,
+            runSpacing: 2,
+            children: model.tasks.map((task) {
+              final enabled = _isTaskEnabled(model, task);
+              final taskOpacity = enabled ? 1.0 : 0.35;
+              final taskDeco = enabled ? null : TextDecoration.lineThrough;
+
+              return GestureDetector(
+                onTap: () => _toggleTask(model, task),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _taskColor(task).withAlpha(enabled ? 25 : 8),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        enabled ? Icons.check_circle : Icons.remove_circle,
+                        size: 12,
+                        color: enabled ? _taskColor(task) : Colors.grey,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        task.label,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: _taskColor(
+                            task,
+                          ).withAlpha((taskOpacity * 255).round()),
+                          fontFamily: "Syne",
+                          decoration: taskDeco,
+                          decorationThickness: 2.0,
+                          decorationColor: Colors.grey,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _removeModel(model),
+              icon: const Icon(Icons.delete_outline, size: 14),
+              label: const Text('Remove', style: TextStyle(fontSize: 12)),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(color: cs.error, width: 1),
+                foregroundColor: cs.error,
+                padding: const EdgeInsets.symmetric(vertical: 4),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color _taskColor(EmbeddingTask task) {
+    switch (task) {
+      case EmbeddingTask.metadataText:
+        return const Color(0xFF00BCD4);
+      case EmbeddingTask.imageEmbedding:
+        return const Color(0xFF7C4DFF);
+      case EmbeddingTask.audioAnalysis:
+        return const Color(0xFFF36E36);
+      case EmbeddingTask.ocr:
+        return const Color(0xFF9436A6);
+      case EmbeddingTask.speechToText:
+        return const Color(0xFF4EB8A0);
+    }
+  }
+
+  Widget _buildModelUpload(ColorScheme cs) {
+    return DottedBorder(
+      options: RoundedRectDottedBorderOptions(
+        color: cs.primary.withAlpha(160),
+        strokeWidth: 2.5,
+        radius: const Radius.circular(10),
+        strokeCap: StrokeCap.butt,
+      ),
+      child: GestureDetector(
+        onTap: _pickAndInstallModel,
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.cloud_upload_outlined, size: 48, color: cs.primary),
+                const SizedBox(height: 12),
+                Text(
+                  'Upload Model ZIP',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: cs.primary,
+                    fontFamily: 'Syne',
                   ),
                 ),
               ],
             ),
-          ] else ...[
-            Text(
-              'No model installed. Install a model to enable smart search.',
-              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _pickAndInstallModel,
-                icon: const Icon(Icons.upload_file, size: 18),
-                label: const Text('Install Model from ZIP'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: cs.primary,
-                  foregroundColor: cs.onPrimary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGpuToggle(ColorScheme cs) {
+    final canUseGpu = _specs?.supportsGpuAcceleration ?? false;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withAlpha(100),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            _gpuAcceleration ? Icons.speed : Icons.speed_outlined,
+            size: 18,
+            color: canUseGpu ? cs.onSurfaceVariant : cs.error,
+          ),
+          const SizedBox(width: 18),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'GPU Acceleration',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontFamily: "Syne",
+                    fontVariations: const [FontVariation('wght', 600)],
+                    color: cs.onSurface,
+                  ),
                 ),
-              ),
+              ],
             ),
-            const SizedBox(height: 6),
-            Text(
-              'ZIP must contain package.txt + model files',
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-            ),
-          ],
+          ),
+          Switch(
+            value: _gpuAcceleration,
+            onChanged: canUseGpu ? _toggleGpuAcceleration : null,
+          ),
         ],
       ),
     );
@@ -556,14 +1108,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           const SizedBox(height: 10),
           _specRow(cs, Icons.memory, 'CPU', s.cpuModel),
           _specRow(cs, Icons.scatter_plot, 'Cores', '${s.cpuCores}'),
-          _specRow(cs, Icons.speed, 'Clock', _formatClock(s.cpuClockKhz)),
           _specRow(
             cs,
             Icons.storage,
             'RAM',
             '${s.ramGb.toStringAsFixed(1)} GB',
           ),
-          const Divider(height: 16),
+          Divider(height: 12, color: cs.onSurface.withAlpha(80)),
           _specRow(cs, Icons.videocam, 'GPU', s.gpuName),
           _specRow(
             cs,
@@ -656,78 +1207,12 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     );
   }
 
-  Widget _buildTierSelector(ColorScheme cs) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Text(
-              'Tier',
-              style: TextStyle(
-                fontSize: 12,
-                fontFamily: "Syne",
-                fontVariations: const [FontVariation('wght', 600)],
-                color: cs.onSurface,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                color: cs.primaryContainer,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                'Recommended: ${_specs?.tierRecommendation ?? 'high'}',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: cs.onPrimaryContainer,
-                  fontFamily: "Syne",
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        SegmentedButton<_Tier>(
-          style: ButtonStyle(
-            backgroundColor: WidgetStateProperty.resolveWith((states) {
-              if (states.contains(WidgetState.selected)) return cs.primary;
-              return null;
-            }),
-            foregroundColor: WidgetStateProperty.resolveWith((states) {
-              if (states.contains(WidgetState.selected)) return cs.onPrimary;
-              return null;
-            }),
-            side: WidgetStatePropertyAll(
-              BorderSide(color: cs.primary, width: 1.5),
-            ),
-          ),
-          segments: const [
-            ButtonSegment(value: _Tier.low, label: Text('Low')),
-            ButtonSegment(value: _Tier.high, label: Text('High')),
-          ],
-          selected: {_tier},
-          onSelectionChanged: (t) => setState(() => _tier = t.first),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          _tier == _Tier.high
-              ? 'High tier: ≥2GB VRAM, ≥8GB RAM, ≥2 cores @ 8GHz+'
-              : 'Low tier: lighter models, works on most hardware',
-          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-        ),
-      ],
-    );
-  }
-
   Widget _buildDownloadSection(ColorScheme cs) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Download Host Binary',
+          'Runtime binary',
           style: TextStyle(
             fontSize: 12,
             fontFamily: "Syne",
@@ -764,7 +1249,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               onPressed: _startDownload,
               icon: const Icon(Icons.download, size: 18),
               label: Text(
-                'Download ${_tier == _Tier.high ? 'high' : 'low'} tier binary',
+                'Download ${_tier == _Tier.high ? 'high' : 'low'} tier zip',
               ),
               style: FilledButton.styleFrom(
                 backgroundColor: cs.primary,
@@ -782,11 +1267,5 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
         ],
       ],
     );
-  }
-
-  String _formatClock(int khz) {
-    if (khz >= 1000000) return '${(khz / 1000000).toStringAsFixed(1)} GHz';
-    if (khz >= 1000) return '${(khz / 1000).toStringAsFixed(0)} MHz';
-    return '$khz kHz';
   }
 }

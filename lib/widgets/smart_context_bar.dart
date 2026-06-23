@@ -367,7 +367,8 @@ class _ContextBarFieldState extends State<_ContextBarField> {
                         ),
                         onPressed: () {
                           widget.controller.clear();
-                          _applyFilter('');
+                          _removeSuggestions();
+                          FilterService.instance.clear();
                         },
                       )
                     : SizedBox.shrink();
@@ -434,7 +435,7 @@ List<Token> tokenize(String text) {
   final customTags = CustomTagsStore.instance.tags;
 
   List<Token> tokens = [];
-  final regexTokens = RegExp(
+final regexTokens = RegExp(
     r'(\\@)' // 1. escaped @
     r'|(@has:(?:audio|speech|text))' // 2. modality
     r'|(\(|\))' // 3. brackets
@@ -444,8 +445,9 @@ List<Token> tokenize(String text) {
     r'|(@\.[a-zA-Z0-9]{2,4}(?=\s|$|[&|!()]))' // 7. extension
     r'|(@(?:video|gif|picture|image|photo|audio|sound))' // 8. filetype
     r'|(@date[><=:][^\s@&|!()]+)' // 9. date logical
-    r'|(@(?:size|length|duration|width|height|fps|score)(?:[<>=]=?)[^\s@&|!()]+)' // 10. logical
-    r'|(@folder:[^\s@&|!()]*)' // 11. folder (valid or invalid, checked below)
+    r'|(@date\?[0-9]{4}(?:[\d.]*))' // 9b. date format: @date?YYYY, @date?MM.YYYY, @date?DD.MM.YYYY
+    r'|(@(?:size|length|duration|width|height|fps|score)(?:[<>=]=?)[^\s@&|!()]+)' // 10. other logical
+    r'|(@folder:[^\s@&|!()]*)' // 11. folder
     r'|(@[^\s]*)', // 12. catch-all
     caseSensitive: false,
   );
@@ -475,16 +477,14 @@ List<Token> tokenize(String text) {
       type = TokTagFileext();
     } else if (match.group(8) != null) {
       type = TokTagFiletype();
-    } else if (match.group(9) != null) {
-      type = TokTagLogical();
-    } else if (match.group(10) != null) {
+    } else if (match.group(9) != null || match.group(10) != null) {
       type = TokTagLogical();
     } else if (match.group(11) != null) {
-      // @folder: - validate the path portion
-      final slug = g.substring(1); // strip @
-      type = _folderPathRegex.hasMatch(slug) ? TokTagFolder() : TokTagInvalid();
+      type = TokTagLogical();
     } else if (match.group(12) != null) {
-      // catch-all: known custom tag or invalid
+      final slug = g.substring(1);
+      type = _folderPathRegex.hasMatch(slug) ? TokTagFolder() : TokTagInvalid();
+    } else if (match.group(13) != null) {
       final word = g.startsWith('@')
           ? g.substring(1).toLowerCase()
           : g.toLowerCase();
@@ -619,7 +619,7 @@ class TokEscaped extends TokenType {
 
 class TokSemanticText extends TokenType {
   @override
-  final TextStyle style = _underlined(Color(0xFF00BCD4));
+  final TextStyle style = const TextStyle();
 }
 
 // autocomplete popup

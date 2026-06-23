@@ -557,7 +557,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       ),
       floatingActionButton: Builder(
         builder: (context) {
-          final hasModel = DownloadManager.instance.getInstalledModel() != null;
+          final hasModel = DownloadManager.instance.getInstalledModels().isNotEmpty;
           return Tooltip(
             message: hasModel
                 ? 'Index folder + generate embeddings'

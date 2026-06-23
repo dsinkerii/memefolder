@@ -8,12 +8,13 @@ import 'package:path/path.dart' as p;
 
 class ClipBackend extends EmbeddingBackend {
   final String modelDir;
+  final bool useGpu;
 
   OrtSession? _visionSession;
   OrtSession? _textSession;
   ClipBpeTokenizer? _tokenizer;
 
-  ClipBackend({required this.modelDir});
+  ClipBackend({required this.modelDir, this.useGpu = false});
 
   @override
   EmbeddingModelKind get kind => EmbeddingModelKind.clipVitB32;
@@ -54,8 +55,8 @@ class ClipBackend extends EmbeddingBackend {
       mergesPath: mergesPath,
     );
 
-    _visionSession = await createOrtSession(visionPath);
-    _textSession = await createOrtSession(textPath);
+    _visionSession = await createOrtSession(visionPath, useGpu: useGpu);
+    _textSession = await createOrtSession(textPath, useGpu: useGpu);
   }
 
   @override

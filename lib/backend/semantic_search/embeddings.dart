@@ -7,10 +7,10 @@ import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart'
 
 // FACTORY!
 class EmbeddingBackendFactory {
-  static EmbeddingBackend create(ModelInstallInfo info) {
+  static EmbeddingBackend create(ModelInstallInfo info, {bool useGpu = false}) {
     switch (info.kind) {
       case EmbeddingModelKind.clipVitB32:
-        return ClipBackend(modelDir: info.modelDir!);
+        return ClipBackend(modelDir: info.modelDir!, useGpu: useGpu);
       case EmbeddingModelKind.jinaV5OmniNano:
         return JinaBackend(modelDir: info.modelDir!);
     }

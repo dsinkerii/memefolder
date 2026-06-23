@@ -634,7 +634,11 @@ class _AudioMetadataSectionState extends State<_AudioMetadataSection> {
             children: [
               Row(
                 children: [
-                  Icon(Icons.audio_file, size: 16, color: cs.onSurfaceVariant),
+                  Icon(
+                    Icons.audio_file_outlined,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
                   const SizedBox(width: 6),
                   Text(
                     'Audio Metadata',
@@ -1419,30 +1423,34 @@ class _MediaPreviewState extends State<_MediaPreview> {
                           PlayerPrefs.setFloat('video_volume', _volume);
                         },
                       ),
-                      Expanded(
-                        child: SliderTheme(
-                          data: SliderThemeData(
-                            thumbShape: const RoundSliderThumbShape(
-                              enabledThumbRadius: 6,
+
+                      ConstrainedBox(
+                        constraints: BoxConstraints(maxWidth: 160),
+                        child: Expanded(
+                          child: SliderTheme(
+                            data: SliderThemeData(
+                              thumbShape: const RoundSliderThumbShape(
+                                enabledThumbRadius: 6,
+                              ),
+                              overlayShape: const RoundSliderOverlayShape(
+                                overlayRadius: 12,
+                              ),
+                              trackHeight: 3,
+                              activeTrackColor: cs.primary,
+                              inactiveTrackColor: cs.onSurface.withAlpha(30),
+                              thumbColor: cs.primary,
+                              overlayColor: cs.primary.withAlpha(30),
                             ),
-                            overlayShape: const RoundSliderOverlayShape(
-                              overlayRadius: 12,
+                            child: Slider(
+                              value: _volume,
+                              min: 0,
+                              max: 100,
+                              onChanged: (value) {
+                                setState(() => _volume = value);
+                                _player.setVolume(value);
+                                PlayerPrefs.setFloat('video_volume', value);
+                              },
                             ),
-                            trackHeight: 3,
-                            activeTrackColor: cs.primary,
-                            inactiveTrackColor: cs.onSurface.withAlpha(30),
-                            thumbColor: cs.primary,
-                            overlayColor: cs.primary.withAlpha(30),
-                          ),
-                          child: Slider(
-                            value: _volume,
-                            min: 0,
-                            max: 100,
-                            onChanged: (value) {
-                              setState(() => _volume = value);
-                              _player.setVolume(value);
-                              PlayerPrefs.setFloat('video_volume', value);
-                            },
                           ),
                         ),
                       ),
@@ -1644,6 +1652,8 @@ class _AudioPreviewState extends State<_AudioPreview> {
                       ],
                     ),
                   ),
+
+                  _buildAudioVolumeBar(cs),
                 ],
               ),
               if (_waveform != null && _waveform!.isNotEmpty) ...[
@@ -1654,11 +1664,7 @@ class _AudioPreviewState extends State<_AudioPreview> {
                 const SizedBox(height: 8),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(child: _buildAudioSeekBar(cs)),
-                    const SizedBox(width: 4),
-                    _buildAudioVolumeBar(cs),
-                  ],
+                  children: [Expanded(child: _buildAudioSeekBar(cs))],
                 ),
               ],
             ],

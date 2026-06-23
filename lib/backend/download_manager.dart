@@ -136,35 +136,28 @@ class DownloadManager {
     final extractDir = p.join(dir, zipName);
 
     try {
-      // clean previous install if exists
       final existing = Directory(extractDir);
       if (await existing.exists()) {
         await existing.delete(recursive: true);
       }
 
-      // read and decode zip
       final bytes = await file.readAsBytes();
       final archive = ZipDecoder().decodeBytes(bytes);
 
-      // detect if all files are under a single top-level folder
-      // e.g. "low-tier-clip/vocab.json" -> strip the common prefix
       final topLevelFolders = <String>{};
       for (final archiveFile in archive) {
         if (archiveFile.name.isEmpty) continue;
         final parts = archiveFile.name.split('/');
-        // ignore trailing empty parts from directory entries
         final nonEmpty = parts.where((p) => p.isNotEmpty).toList();
         if (nonEmpty.length > 1) {
           topLevelFolders.add(nonEmpty.first);
         }
       }
 
-      // if exactly one top-level folder and all files are under it, strip it
       final stripPrefix = topLevelFolders.length == 1
           ? '${topLevelFolders.first}/'
           : '';
 
-      // extract all files
       for (final archiveFile in archive) {
         var name = archiveFile.name;
         if (stripPrefix.isNotEmpty && name.startsWith(stripPrefix)) {
@@ -182,11 +175,13 @@ class DownloadManager {
         }
       }
 
-      // parse manifest
       final manifest = ModelManifest.fromDir(extractDir);
+      if (manifest == null) {
+        await Directory(extractDir).delete(recursive: true);
+        return null;
+      }
       return manifest;
     } catch (_) {
-      // clean up on failure
       final failed = Directory(extractDir);
       if (await failed.exists()) {
         await failed.delete(recursive: true);
@@ -195,7 +190,6 @@ class DownloadManager {
     }
   }
 
-  // remove an installed model by directory name.
   Future<void> removeModel(String modelDirName) async {
     final dir = Directory(p.join(_modelsDir, modelDirName));
     if (await dir.exists()) {
@@ -203,29 +197,30 @@ class DownloadManager {
     }
   }
 
-  /// get the manifest of the currently installed model, if any.
-  ModelManifest? getInstalledModel() {
+  List<ModelManifest> getInstalledModels() {
     final modelsDir = Directory(_modelsDir);
-    if (!modelsDir.existsSync()) return null;
+    if (!modelsDir.existsSync()) return [];
 
+    final results = <ModelManifest>[];
     for (final entity in modelsDir.listSync()) {
       if (entity is Directory) {
         final manifest = ModelManifest.fromDir(entity.path);
-        if (manifest != null) return manifest;
+        if (manifest != null) results.add(manifest);
       }
     }
-    return null;
+    return results;
   }
 
-  // get directory name of the installed model, if any.
-  String? getInstalledModelDirName() {
-    final modelsDir = Directory(_modelsDir);
-    if (!modelsDir.existsSync()) return null;
+  String? getModelDirName(ModelManifest manifest) {
+    final metaDir = Directory(_modelsDir);
+    if (!metaDir.existsSync()) return null;
 
-    for (final entity in modelsDir.listSync()) {
+    for (final entity in metaDir.listSync()) {
       if (entity is Directory) {
-        final manifest = ModelManifest.fromDir(entity.path);
-        if (manifest != null) return p.basename(entity.path);
+        final m = ModelManifest.fromDir(entity.path);
+        if (m != null && m.name == manifest.name && m.type == manifest.type) {
+          return p.basename(entity.path);
+        }
       }
     }
     return null;

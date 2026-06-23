@@ -8,16 +8,55 @@ import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 
 bool _ortInitialized = false;
 
-Future<OrtSession> createOrtSession(String modelPath) async {
+Future<OrtSession> createOrtSession(
+  String modelPath, {
+  bool useGpu = false,
+}) async {
   if (!_ortInitialized) {
     OrtEnv.instance.init();
     _ortInitialized = true;
   }
   final options = OrtSessionOptions();
-  await options.appendDefaultProviders();
+
+  if (useGpu) {
+    var hasGpu = false;
+    hasGpu = await _tryAppendGpuProvider(options);
+    if (!hasGpu) {
+      await options.appendDefaultProviders();
+    } else {
+      options.appendCPUProvider(CPUFlags.useArena);
+    }
+  } else {
+    await options.appendDefaultProviders();
+  }
+
   final file = File(modelPath);
   final session = OrtSession.fromFile(file, options);
   return session;
+}
+
+Future<bool> _tryAppendGpuProvider(OrtSessionOptions options) async {
+  try {
+    if (options.appendCudaProvider(CUDAFlags.useArena)) return true;
+  } catch (_) {}
+
+  try {
+    if (options.appendDirectMLProvider()) return true;
+  } catch (_) {}
+
+  try {
+    if (options.appendRocmProvider(ROCmFlags.useArena)) return true;
+  } catch (_) {}
+
+  try {
+    if (options.appendCoreMLProvider(CoreMLFlags.useNone)) return true;
+  } catch (_) {}
+
+  try {
+    if (options.appendNnapiProvider(NnapiFlags.useNone)) return true;
+  } catch (_) {}
+
+  return false;
 }
 
 Future<void> closeOrtSession(OrtSession? session) async {

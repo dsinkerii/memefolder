@@ -8,8 +8,9 @@ import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart'
 class SemanticSearchService {
   SemanticSearchConfig _config;
   EmbeddingBackend? _backend;
+  final bool useGpu;
 
-  SemanticSearchService(this._config);
+  SemanticSearchService(this._config, {this.useGpu = false});
 
   SemanticSearchConfig get config => _config;
   EmbeddingBackend? get backend => _backend;
@@ -21,7 +22,7 @@ class SemanticSearchService {
       return;
     }
 
-    final backend = EmbeddingBackendFactory.create(info);
+    final backend = EmbeddingBackendFactory.create(info, useGpu: useGpu);
     if (!await backend.isAvailable()) {
       _backend = null;
       return;

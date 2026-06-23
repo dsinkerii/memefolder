@@ -5,6 +5,7 @@ import 'package:memefolder/backend/indexer.dart';
 import 'package:memefolder/backend/semantic_search/cosine_search.dart';
 import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart';
 import 'package:memefolder/backend/semantic_service.dart';
+import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -160,7 +161,8 @@ class _Parser {
     // tags
     if (tok.type is TokTagFiletype ||
         tok.type is TokTagFileext ||
-        tok.type is TokTagFolder) {
+        tok.type is TokTagFolder ||
+        tok.type is TokTagLogical) {
       _pos++;
       return _tokenToFilter(tok);
     }
@@ -180,6 +182,7 @@ FilterExpr? parseFilterExpression(String query) {
     return ty is TokTagFiletype ||
         ty is TokTagFileext ||
         ty is TokTagFolder ||
+        ty is TokTagLogical ||
         ty is TokOpAnd ||
         ty is TokOpOr ||
         ty is TokOpNot ||
@@ -362,7 +365,8 @@ class FilterService extends ChangeNotifier {
         },
       );
 
-      final service = SemanticSearchService(config);
+      final useGpu = PlayerPrefs.getBool(PlayerPrefs.gpuAccelerationKey, true);
+      final service = SemanticSearchService(config, useGpu: useGpu);
       await service.initialize();
 
       if (!service.isReady) {

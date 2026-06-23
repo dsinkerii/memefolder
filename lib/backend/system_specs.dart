@@ -22,6 +22,21 @@ class SystemSpecs {
   bool get isHighEnd =>
       vramGb >= 2.0 && ramGb >= 8.0 && cpuClockKhz >= 8000 || cpuCores >= 2;
 
+  bool get supportsGpuAcceleration => !isIntegratedGpu && vramGb >= 2.0;
+
+  String get recommendedGpuProvider {
+    if (!supportsGpuAcceleration) return 'CPU';
+    if (Platform.isLinux && gpuName.toLowerCase().contains('nvidia')) {
+      return 'CUDA';
+    }
+    if (Platform.isLinux && (gpuName.toLowerCase().contains('amd') || gpuName.toLowerCase().contains('radeon'))) {
+      return 'ROCm';
+    }
+    if (Platform.isWindows) return 'DirectML';
+    if (Platform.isMacOS) return 'CoreML';
+    return 'CPU';
+  }
+
   String get tierRecommendation => isHighEnd ? 'high' : 'low';
 
   static Future<SystemSpecs> detect() async {

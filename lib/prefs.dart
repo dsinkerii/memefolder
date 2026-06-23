@@ -153,6 +153,8 @@ class PlayerPrefs {
     return val ?? defValue;
   }
 
+  static const String gpuAccelerationKey = 'gpu_acceleration';
+
   static bool getBool(String key, bool defValue) {
     if (_cache.containsKey(key)) {
       return _cache[key] as bool;

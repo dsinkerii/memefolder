@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:just_audio/just_audio.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:memefolder/backend/custom_tags_store.dart';
 import 'package:memefolder/backend/semantic_search/embeddings.dart';
 import 'package:memefolder/backend/semantic_search/semantic_search_classes.dart';
 import 'package:memefolder/backend/semantic_service.dart';
+import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
 
@@ -94,9 +96,10 @@ Future<void> indexDirectory(
     await File(tmpPath).rename(dbPath);
     onProgress?.call(1.0);
 
-    // after metadata scan, auto-embed if model is installed
-    final manifest = DownloadManager.instance.getInstalledModel();
-    if (manifest != null) {
+    // after metadata scan, auto-embed for each model
+    final models = DownloadManager.instance.getInstalledModels();
+    for (final manifest in models) {
+      if (cancelToken?.isCancelled ?? false) break;
       await embedDirectory(
         currentPath,
         onProgress: onProgress != null ? (p, _) => onProgress(p) : null,
@@ -510,7 +513,6 @@ Future<void> _scanAndIndex(
 }
 
 Future<void> _congratulateScanEnd() async {
-  await _player.play();
   showBubble(
     const Row(
       mainAxisSize: MainAxisSize.min,
@@ -809,50 +811,46 @@ Future<void> _createSchema(Database db, String currentPath) async {
 }
 
 // embedding indexer
-Future<void> embedDirectory(
-  String rootPath, {
-  void Function(double progress, String currentFile)? onProgress,
-  CancellationToken? cancelToken,
-  ModelManifest? manifest,
+
+class _EmbedPassResult {
+  final int embedded;
+  final int failed;
+  const _EmbedPassResult({required this.embedded, required this.failed});
+}
+
+Future<SemanticSearchService> _initService(
+  String modelDir,
+  bool useGpu, {
+  String? label,
 }) async {
-  final dbPath = p.join(rootPath, '.memefolder.db');
-  if (!File(dbPath).existsSync()) return;
-
-  // determine capabilities from manifest or fallback to defaults
-  final embedImages = manifest?.supportsImage ?? true;
-  final embedTexts = manifest?.supportsText ?? true;
-  final extractVideoKeyframes = manifest?.supportsImage ?? true;
-  final extractAudioKeyframes = manifest?.supportsImage ?? true;
-
-  showBubble(
-    Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const Icon(Icons.sync, color: Colors.white),
-        const SizedBox(width: 12),
-        Text(
-          manifest != null
-              ? 'indexing with ${manifest.name}...'
-              : 'generating embeddings...',
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 14,
-            fontWeight: FontWeight.w500,
-            decoration: TextDecoration.none,
+  if (label != null) {
+    showBubble(
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.white,
+            ),
           ),
-          softWrap: true,
-        ),
-      ],
-    ),
-  );
-
-  // locate model dir
-  final modelDir = findModelDir();
-  if (modelDir == null) {
-    return; // silently skip - no model installed
+          const SizedBox(width: 12),
+          Text(
+            'loading $label...',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        ],
+      ),
+    );
   }
-
-  // initialize backend
   final config = SemanticSearchConfig(
     activeModel: EmbeddingModelKind.clipVitB32,
     models: {
@@ -865,18 +863,245 @@ Future<void> embedDirectory(
       ),
     },
   );
-
-  final service = SemanticSearchService(config);
+  final service = SemanticSearchService(config, useGpu: useGpu);
   await service.initialize();
+  return service;
+}
 
-  if (!service.isReady) {
-    return; // silently skip
+Future<_EmbedPassResult> _embedPass(
+  Database db,
+  String rootPath,
+  List<Map<String, Object?>> rows,
+  String modalityPass, {
+  required ModelManifest? manifest,
+  required String modelDir,
+  required bool useGpu,
+  CancellationToken? cancelToken,
+  void Function(double, String)? onProgress,
+}) async {
+  final isText = modalityPass == 'text';
+  final service = await _initService(
+    modelDir,
+    useGpu,
+    label: '${manifest?.name ?? 'model'} ($modalityPass)',
+  );
+  if (!service.isReady) return const _EmbedPassResult(embedded: 0, failed: 0);
+
+  var embedded = 0;
+  var failed = 0;
+
+  try {
+    for (int i = 0; i < rows.length; i++) {
+      if (cancelToken?.isCancelled ?? false) break;
+
+      final row = rows[i];
+      final fileId = row['id'] as int;
+      final relPath = row['rel_path'] as String;
+      final mediaType = row['media_type'] as String;
+      final name = row['name'] as String;
+      final stem = row['stem'] as String;
+      final combinedText = row['combined_text'] as String?;
+      final aiDesc = row['ai_description'] as String?;
+      final artist = row['artist'] as String?;
+      final album = row['album'] as String?;
+      final genre = row['genre'] as String?;
+      final year = row['year'] as int?;
+      final comment = row['comment'] as String?;
+
+      onProgress?.call(i / rows.length, name);
+
+      try {
+        if (isText) {
+          final textContext = _buildTextContext(
+            stem: stem,
+            name: name,
+            combinedText: combinedText,
+            aiDesc: aiDesc,
+            artist: artist,
+            album: album,
+            genre: genre,
+            year: year,
+            comment: comment,
+            tags: mediaType == 'image'
+                ? []
+                : await getFileTags(rootPath, p.join(rootPath, relPath)),
+          );
+          final vec = await service.embedText(textContext);
+          await _storeEmbedding(
+            db,
+            fileId,
+            vec,
+            'text',
+            embeddingHint: textContext,
+          );
+        } else {
+          final file = File(p.join(rootPath, relPath));
+          if (await file.exists()) {
+            final vec = await service.embedImageFile(file);
+            await _storeEmbedding(
+              db,
+              fileId,
+              vec,
+              'image',
+              embeddingHint: '[image embedding]',
+            );
+          }
+        }
+        embedded++;
+      } catch (e) {
+        failed++;
+        debugPrint('embed $modalityPass failed for $relPath: $e');
+        await _storeFailure(db, fileId, '$e');
+        _warnplayer.play();
+      }
+    }
+  } finally {
+    await service.backend?.dispose();
   }
+
+  return _EmbedPassResult(embedded: embedded, failed: failed);
+}
+
+Future<_EmbedPassResult> _embedKeyframePass(
+  Database db,
+  String rootPath,
+  List<Map<String, Object?>> rows, {
+  required bool extractVideoKeyframes,
+  required bool extractAudioKeyframes,
+  int videoFrameCount = 1,
+  required ModelManifest? manifest,
+  required String modelDir,
+  required bool useGpu,
+  CancellationToken? cancelToken,
+  void Function(double, String)? onProgress,
+}) async {
+  final service = await _initService(
+    modelDir,
+    useGpu,
+    label: '${manifest?.name ?? 'model'} (keyframes)',
+  );
+  if (!service.isReady) return const _EmbedPassResult(embedded: 0, failed: 0);
+
+  var embedded = 0;
+  var failed = 0;
+
+  try {
+    for (int i = 0; i < rows.length; i++) {
+      if (cancelToken?.isCancelled ?? false) break;
+
+      final row = rows[i];
+      final fileId = row['id'] as int;
+      final relPath = row['rel_path'] as String;
+      final mediaType = row['media_type'] as String;
+      final name = row['name'] as String;
+      final absPath = p.join(rootPath, relPath);
+
+      onProgress?.call(i / rows.length, name);
+
+      try {
+        if (mediaType == 'video' && extractVideoKeyframes) {
+          if (videoFrameCount > 1) {
+            // multi-frame: extract N keyframes, average embeddings
+            final frames = await _extractVideoKeyframes(
+              absPath,
+              videoFrameCount,
+            );
+            if (frames.isNotEmpty) {
+              final vecs = <Float32List>[];
+              for (final f in frames) {
+                final v = await service.embedImageFile(f);
+                vecs.add(v.values);
+                await f.delete();
+              }
+              final avg = Float32List(vecs.first.length);
+              for (final v in vecs) {
+                for (int j = 0; j < avg.length; j++) avg[j] += v[j];
+              }
+              for (int j = 0; j < avg.length; j++) avg[j] /= vecs.length;
+              final vec = EmbeddingVector(
+                values: avg,
+                model: EmbeddingModelKind.clipVitB32,
+                modality: EmbeddingModality.image,
+                dims: avg.length,
+              );
+              await _storeEmbedding(
+                db,
+                fileId,
+                vec,
+                'video',
+                embeddingHint: '[${videoFrameCount}-frame video embedding]',
+              );
+            }
+          } else {
+            final keyframe = await _extractVideoKeyframe(absPath);
+            if (keyframe != null) {
+              final vec = await service.embedImageFile(keyframe);
+              await _storeEmbedding(
+                db,
+                fileId,
+                vec,
+                'image',
+                embeddingHint: '[video keyframe embedding]',
+              );
+              await keyframe.delete();
+            }
+          }
+        } else if (mediaType == 'audio' && extractAudioKeyframes) {
+          final keyframe = await _extractAudioKeyframe(absPath);
+          if (keyframe != null) {
+            final vec = await service.embedImageFile(keyframe);
+            await _storeEmbedding(
+              db,
+              fileId,
+              vec,
+              'image',
+              embeddingHint: '[audio spectrogram embedding]',
+            );
+            await keyframe.delete();
+          }
+        } else {
+          continue;
+        }
+        embedded++;
+      } catch (e) {
+        failed++;
+        debugPrint('keyframe embed failed for $relPath: $e');
+        await _storeFailure(db, fileId, '$e');
+        _warnplayer.play();
+      }
+    }
+  } finally {
+    await service.backend?.dispose();
+  }
+
+  return _EmbedPassResult(embedded: embedded, failed: failed);
+}
+
+Future<void> embedDirectory(
+  String rootPath, {
+  void Function(double progress, String currentFile)? onProgress,
+  CancellationToken? cancelToken,
+  ModelManifest? manifest,
+}) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return;
+
+  final embedImages = manifest?.supportsImage ?? true;
+  final embedTexts = manifest?.supportsText ?? true;
+  final extractVideoKeyframes =
+      manifest?.supportsVideo ?? manifest?.supportsImage ?? false;
+  final extractAudioKeyframes =
+      manifest?.supportsAudio ?? manifest?.supportsImage ?? false;
+  final videoFrameCount = manifest?.supportsVideo == true ? 6 : 1;
+
+  final modelDir = findModelDir();
+  if (modelDir == null) return;
+
+  final useGpu = PlayerPrefs.getBool(PlayerPrefs.gpuAccelerationKey, true);
 
   try {
     final db = await openDatabase(dbPath, singleInstance: false);
 
-    // ensure failures table exists (for old DBs)
     await db.execute('''
       CREATE TABLE IF NOT EXISTS embedding_failures (
         file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -885,7 +1110,6 @@ Future<void> embedDirectory(
       );
     ''');
 
-    // clean up any DB internal files that got indexed by mistake
     await db.execute('''
       DELETE FROM file_embeddings WHERE file_id IN (
         SELECT id FROM files WHERE name LIKE '.memefolder.db%'
@@ -900,7 +1124,6 @@ Future<void> embedDirectory(
       DELETE FROM files WHERE name LIKE '.memefolder.db%'
     ''');
 
-    // find files that don't have embeddings yet
     final rows = await db.rawQuery('''
       SELECT f.id, f.rel_path, f.media_type, f.name, f.stem,
              ft.combined_text, ft.ai_description,
@@ -914,190 +1137,171 @@ Future<void> embedDirectory(
     final totalCount = rows.length;
     if (totalCount == 0) {
       await db.close();
-      await service.backend?.dispose();
-      return; // all already embedded
+      return;
     }
 
     var embeddedCount = 0;
     var failedCount = 0;
 
-    for (final row in rows) {
-      if (cancelToken?.isCancelled ?? false) break;
+    // lazy load/unload per modality:
+    // each pass initializes service → processes files → disposes
 
-      final fileId = row['id'] as int;
-      final relPath = row['rel_path'] as String;
-      final mediaType = row['media_type'] as String;
-      final name = row['name'] as String;
-      final stem = row['stem'] as String;
-      final combinedText = row['combined_text'] as String?;
-      final aiDesc = row['ai_description'] as String?;
-      final artist = row['artist'] as String?;
-      final album = row['album'] as String?;
-      final genre = row['genre'] as String?;
-      final year = row['year'] as int?;
-      final comment = row['comment'] as String?;
-
-      final absPath = p.join(rootPath, relPath);
-
-      // fetch user-assigned tags for embedding context
-      final userTags = await getFileTags(rootPath, absPath);
-
-      onProgress?.call(embeddedCount / totalCount, name);
-
-      try {
-        switch (mediaType) {
-          case 'image':
-            if (embedImages) {
-              final file = File(absPath);
-              if (await file.exists()) {
-                final vec = await service.embedImageFile(file);
-                await _storeEmbedding(
-                  db,
-                  fileId,
-                  vec,
-                  'image',
-                  embeddingHint: '[image embedding]',
-                );
-              }
-            }
-            break;
-
-          case 'video':
-            // embed text context from filename + metadata
-            if (embedTexts) {
-              final textContext = _buildTextContext(
-                stem: stem,
-                name: name,
-                combinedText: combinedText,
-                aiDesc: aiDesc,
-                artist: artist,
-                album: album,
-                genre: genre,
-                year: year,
-                comment: comment,
-                tags: userTags,
-              );
-              final vec = await service.embedText(textContext);
-              await _storeEmbedding(
-                db,
-                fileId,
-                vec,
-                'text',
-                embeddingHint: textContext,
-              );
-            }
-            // extract keyframe and embed as image
-            if (extractVideoKeyframes) {
-              final keyframe = await _extractVideoKeyframe(absPath);
-              if (keyframe != null) {
-                final vec = await service.embedImageFile(keyframe);
-                await _storeEmbedding(
-                  db,
-                  fileId,
-                  vec,
-                  'image',
-                  embeddingHint: '[video keyframe embedding]',
-                );
-                await keyframe.delete();
-              }
-            }
-            break;
-
-          case 'audio':
-            // embed text context from filename + metadata
-            if (embedTexts) {
-              final textContext = _buildTextContext(
-                stem: stem,
-                name: name,
-                combinedText: combinedText,
-                aiDesc: aiDesc,
-                artist: artist,
-                album: album,
-                genre: genre,
-                year: year,
-                comment: comment,
-                tags: userTags,
-              );
-              final vec = await service.embedText(textContext);
-              await _storeEmbedding(
-                db,
-                fileId,
-                vec,
-                'text',
-                embeddingHint: textContext,
-              );
-            }
-            // extract waveform/keyframe placeholder as image
-            if (extractAudioKeyframes) {
-              final keyframe = await _extractAudioKeyframe(absPath);
-              if (keyframe != null) {
-                final vec = await service.embedImageFile(keyframe);
-                await _storeEmbedding(
-                  db,
-                  fileId,
-                  vec,
-                  'image',
-                  embeddingHint: '[audio spectrogram embedding]',
-                );
-                await keyframe.delete();
-              }
-            }
-            break;
-
-          default:
-            // unknown type: embed filename as text
-            if (embedTexts) {
-              final vec = await service.embedText(stem);
-              await _storeEmbedding(
-                db,
-                fileId,
-                vec,
-                'text',
-                embeddingHint: stem,
-              );
-            }
-        }
-        embeddedCount++;
-      } catch (e) {
-        failedCount++;
-        debugPrint('embed failed for $relPath: $e');
-        await _storeFailure(db, fileId, '$e');
-
-        // play warning and show failure bubble
-        _warnplayer.play();
+    if (embedTexts) {
+      final textRows = rows.where((r) {
+        final mt = r['media_type'] as String;
+        return mt != 'image';
+      }).toList();
+      if (textRows.isNotEmpty) {
         showBubble(
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.cancel, color: Colors.white),
+              const Icon(Icons.text_fields, color: Colors.white),
               const SizedBox(width: 12),
-              Flexible(
-                child: Text(
-                  '$name failed: $e',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
-                    decoration: TextDecoration.none,
-                  ),
-                  softWrap: true,
+              Text(
+                manifest != null
+                    ? '${manifest.name}: embedding text...'
+                    : 'embedding text...',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
                 ),
+                softWrap: true,
               ),
             ],
           ),
         );
+        final r = await _embedPass(
+          db,
+          rootPath,
+          textRows,
+          'text',
+          manifest: manifest,
+          modelDir: modelDir,
+          useGpu: useGpu,
+          cancelToken: cancelToken,
+          onProgress: (p, f) => onProgress?.call(
+            (embeddedCount + p * textRows.length) / totalCount,
+            f,
+          ),
+        );
+        embeddedCount += r.embedded;
+        failedCount += r.failed;
+        if (cancelToken?.isCancelled ?? false) {
+          await db.close();
+          return;
+        }
+      }
+    }
+
+    if (embedImages) {
+      final imgRows = rows.where((r) {
+        final mt = r['media_type'] as String;
+        return mt == 'image';
+      }).toList();
+      if (imgRows.isNotEmpty) {
+        showBubble(
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.image, color: Colors.white),
+              const SizedBox(width: 12),
+              Text(
+                manifest != null
+                    ? '${manifest.name}: embedding images...'
+                    : 'embedding images...',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ],
+          ),
+        );
+        final r = await _embedPass(
+          db,
+          rootPath,
+          imgRows,
+          'image',
+          manifest: manifest,
+          modelDir: modelDir,
+          useGpu: useGpu,
+          cancelToken: cancelToken,
+          onProgress: (p, f) => onProgress?.call(
+            (embeddedCount + p * imgRows.length) / totalCount,
+            f,
+          ),
+        );
+        embeddedCount += r.embedded;
+        failedCount += r.failed;
+        if (cancelToken?.isCancelled ?? false) {
+          await db.close();
+          return;
+        }
+      }
+    }
+
+    if (extractVideoKeyframes || extractAudioKeyframes) {
+      final kfRows = rows.where((r) {
+        final mt = r['media_type'] as String;
+        return mt == 'video' || mt == 'audio';
+      }).toList();
+      if (kfRows.isNotEmpty) {
+        showBubble(
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.movie, color: Colors.white),
+              const SizedBox(width: 12),
+              Text(
+                manifest != null
+                    ? '${manifest.name}: keyframes...'
+                    : 'keyframes...',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ],
+          ),
+        );
+        final r = await _embedKeyframePass(
+          db,
+          rootPath,
+          kfRows,
+          extractVideoKeyframes: extractVideoKeyframes,
+          extractAudioKeyframes: extractAudioKeyframes,
+          videoFrameCount: videoFrameCount,
+          manifest: manifest,
+          modelDir: modelDir,
+          useGpu: useGpu,
+          cancelToken: cancelToken,
+          onProgress: (p, f) => onProgress?.call(
+            (embeddedCount + p * kfRows.length) / totalCount,
+            f,
+          ),
+        );
+        embeddedCount += r.embedded;
+        failedCount += r.failed;
       }
     }
 
     await db.close();
-    await service.backend?.dispose();
-
     onProgress?.call(1.0, '');
 
     final msg = failedCount > 0
         ? 'embedded $embeddedCount files ($failedCount failed)'
         : 'embedded $embeddedCount files';
 
+    await _player.play();
     showBubble(
       Row(
         mainAxisSize: MainAxisSize.min,
@@ -1127,15 +1331,17 @@ Future<void> embedDirectory(
         children: [
           const Icon(Icons.error, color: Colors.white),
           const SizedBox(width: 12),
-          Text(
-            'embedding failed: $e',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 14,
-              fontWeight: FontWeight.w500,
-              decoration: TextDecoration.none,
+          Flexible(
+            child: Text(
+              'Embedding error: $e',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                decoration: TextDecoration.none,
+              ),
+              softWrap: true,
             ),
-            softWrap: true,
           ),
         ],
       ),
@@ -1503,6 +1709,50 @@ Future<File?> _extractVideoKeyframe(String videoPath) async {
     tmpDir.deleteSync(recursive: true);
   } catch (_) {}
   return null;
+}
+
+Future<List<File>> _extractVideoKeyframes(String videoPath, int count) async {
+  final files = <File>[];
+  try {
+    // get video duration
+    final probe = await Process.run('ffprobe', [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration',
+      '-of',
+      'csv=p=0',
+      videoPath,
+    ]);
+    final duration = double.tryParse(probe.stdout.toString().trim());
+    if (duration == null || duration <= 0) return files;
+
+    final tmpDir = Directory.systemTemp.createTempSync('clip_keyframes_');
+    final interval = duration / (count + 1); // skip first/last
+
+    for (int i = 1; i <= count; i++) {
+      final seek = interval * i;
+      final outPath = '${tmpDir.path}/frame_$i.jpg';
+      final result = await Process.run('ffmpeg', [
+        '-ss',
+        seek.toStringAsFixed(2),
+        '-i',
+        videoPath,
+        '-vframes',
+        '1',
+        '-q:v',
+        '2',
+        '-y',
+        outPath,
+      ]);
+      if (result.exitCode == 0 && File(outPath).existsSync()) {
+        files.add(File(outPath));
+      }
+    }
+
+    if (files.isEmpty) tmpDir.deleteSync(recursive: true);
+  } catch (_) {}
+  return files;
 }
 
 Future<File?> _extractAudioKeyframe(String audioPath) async {

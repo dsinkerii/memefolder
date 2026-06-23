@@ -1,31 +1,53 @@
 import 'dart:io';
 
-enum EmbeddingModelKind { clipVitB32, jinaV5OmniNano }
-
 enum EmbeddingModality { text, image, audio, video }
 
-/// Parsed model manifest from package.txt inside a model ZIP.
+enum EmbeddingTask {
+  metadataText,
+  imageEmbedding,
+  audioAnalysis,
+  ocr,
+  speechToText;
+
+  String get label {
+    switch (this) {
+      case EmbeddingTask.metadataText:
+        return 'metadata & text';
+      case EmbeddingTask.imageEmbedding:
+        return 'image embedding';
+      case EmbeddingTask.audioAnalysis:
+        return 'audio analysis';
+      case EmbeddingTask.ocr:
+        return 'OCR';
+      case EmbeddingTask.speechToText:
+        return 'speech-to-text';
+    }
+  }
+}
+
 class ModelManifest {
+  final int version;
   final String type;
   final String name;
   final List<String> supports;
+  final List<EmbeddingTask> tasks;
   final String runtime;
   final String modelDir;
   final double scoreScale;
   final double scoreBias;
 
   const ModelManifest({
+    required this.version,
     required this.type,
     required this.name,
     required this.supports,
+    required this.tasks,
     required this.runtime,
     required this.modelDir,
     this.scoreScale = 1.0,
     this.scoreBias = 0.0,
   });
 
-  /// Parse package.txt from a model directory.
-  /// Returns null if file is missing or malformed.
   static ModelManifest? fromDir(String dirPath) {
     final file = File('$dirPath/package.txt');
     if (!file.existsSync()) return null;
@@ -43,18 +65,43 @@ class ModelManifest {
         kv[key] = val;
       }
 
+      final versionStr = kv['version'];
+      final version = int.tryParse(versionStr ?? '');
+      if (version == null || version != 2) return null;
+
       final type = kv['type'];
       final name = kv['name'];
-      final supportsRaw = kv['supports'];
       final runtime = kv['runtime'];
-      if (type == null || name == null || supportsRaw == null || runtime == null) {
-        return null;
-      }
+      if (type == null || name == null || runtime == null) return null;
+
+      final supportsRaw = kv['supports'];
+      final supports = supportsRaw != null
+          ? supportsRaw
+              .split(',')
+              .map((s) => s.trim().toLowerCase())
+              .where((s) => s.isNotEmpty)
+              .toList()
+          : <String>[];
+
+      final taskRaw = kv['task'];
+      final tasks = taskRaw != null
+          ? taskRaw
+              .split(',')
+              .map((s) => s.trim().toLowerCase())
+              .where((s) => s.isNotEmpty)
+              .map((s) => _parseTask(s))
+              .whereType<EmbeddingTask>()
+              .toList()
+          : _inferTasksFromType(type, supports);
+
+      if (tasks.isEmpty) return null;
 
       return ModelManifest(
+        version: version,
         type: type,
         name: name,
-        supports: supportsRaw.split(',').map((s) => s.trim().toLowerCase()).where((s) => s.isNotEmpty).toList(),
+        supports: supports,
+        tasks: tasks,
         runtime: runtime,
         modelDir: dirPath,
         scoreScale: double.tryParse(kv['score_scale'] ?? '') ?? 1.0,
@@ -65,14 +112,50 @@ class ModelManifest {
     }
   }
 
+  static EmbeddingTask? _parseTask(String s) {
+    switch (s) {
+      case 'metadata_text':
+        return EmbeddingTask.metadataText;
+      case 'image_embedding':
+        return EmbeddingTask.imageEmbedding;
+      case 'audio_analysis':
+        return EmbeddingTask.audioAnalysis;
+      case 'ocr':
+        return EmbeddingTask.ocr;
+      case 'speech_to_text':
+        return EmbeddingTask.speechToText;
+      default:
+        return null;
+    }
+  }
+
+  static List<EmbeddingTask> _inferTasksFromType(String type, List<String> supports) {
+    final t = type.toLowerCase();
+    if (t == 'clip' || t == 'jina') {
+      final tasks = [EmbeddingTask.metadataText];
+      if (supports.contains('image')) tasks.add(EmbeddingTask.imageEmbedding);
+      return tasks;
+    }
+    if (t == 'whisper') return [EmbeddingTask.speechToText];
+    if (t == 'ocr' || t == 'trocr') return [EmbeddingTask.ocr];
+    if (t == 'musicgen' || t == 'clap' || t == 'audio_analysis') {
+      return [EmbeddingTask.audioAnalysis];
+    }
+    return [];
+  }
+
   bool get supportsText => supports.contains('text');
   bool get supportsImage => supports.contains('image');
   bool get supportsAudio => supports.contains('audio');
   bool get supportsVideo => supports.contains('video');
 
-  /// Human-readable summary of supported modalities.
-  String get supportsSummary => supports.join(', ');
+  String get supportsSummary => supports.isEmpty ? 'none' : supports.join(', ');
+  String get tasksSummary => tasks.map((t) => t.label).join(', ');
 }
+
+// ---- legacy types (used by existing backends) ----
+
+enum EmbeddingModelKind { clipVitB32, jinaV5OmniNano }
 
 class ModelInstallInfo {
   final EmbeddingModelKind kind;
@@ -81,7 +164,7 @@ class ModelInstallInfo {
   final bool enabled;
   final String? modelDir;
   final String? version;
-  final String? runtime; // onnx, native-sidecar, python, etc.
+  final String? runtime;
 
   const ModelInstallInfo({
     required this.kind,
