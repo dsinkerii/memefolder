@@ -5,9 +5,7 @@ import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gradient_borders/gradient_borders.dart';
-import 'package:memefolder/backend/download_manager.dart';
 import 'package:memefolder/backend/indexer.dart';
-import 'package:memefolder/backend/semantic_search/cosine_search.dart';
 import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
@@ -59,14 +57,10 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   DateTime? _lastPressedAt;
   late Future<List<FileSystemEntity>> _entitiesFuture;
   late Future<Set<String>> _indexedFilesFuture;
-  late Future<Map<String, String>> _embeddingFailuresFuture;
   final Map<String, Future<File?>> _videoThumbnailFutures = {};
   ValueNotifier<bool> isReindexing = ValueNotifier(false);
   ValueNotifier<double> indexProgress = ValueNotifier(0.0);
   CancellationToken? _cancelToken;
-
-  // scores from semantic search (path -> 0.0–1.0)
-  Map<String, double> _semanticScores = {};
 
   // autocomplete state
   List<String> _suggestions = [];
@@ -110,60 +104,19 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       _entitiesFuture = Directory(widget.currentPath).list().toList();
     }
     _indexedFilesFuture = getIndexedFiles(widget.currentPath);
-    _embeddingFailuresFuture = getEmbeddingFailures(widget.currentPath);
   }
 
   Future<List<FileSystemEntity>> _getFilteredEntities(String rootPath) async {
     final filter = FilterService.instance;
     debugPrint(
-      '[folder] _getFilteredEntities hasSemantic=${filter.hasSemanticText} hasTags=${filter.hasTags}',
+      '[folder] _getFilteredEntities isActive=${filter.isActive} hasTags=${filter.hasTags} query="${filter.query}"',
     );
 
-    final hasText = filter.hasSemanticText;
-    final hasTagFilter = filter.hasTags;
+    if (!filter.isActive) return [];
 
-    if (!hasText && !hasTagFilter) {
-      _semanticScores = {};
-      return [];
-    }
-
-    Set<String> tagPaths = {};
-    if (hasTagFilter) {
-      tagPaths = await filter.execute(rootPath);
-      debugPrint('[folder] tag filter returned ${tagPaths.length} paths');
-    }
-
-    List<CosineResult> semanticResults = [];
-    if (hasText) {
-      semanticResults = await filter.executeSemantic(rootPath);
-      debugPrint(
-        '[folder] semantic search returned ${semanticResults.length} results',
-      );
-    }
-
-    // both present: AND - intersect
-    if (hasText && hasTagFilter) {
-      debugPrint(
-        '[folder] AND mode: intersecting ${semanticResults.length} semantic × ${tagPaths.length} tag paths',
-      );
-      final matched = semanticResults
-          .where((r) => tagPaths.contains(r.filePath))
-          .toList();
-      _semanticScores = {for (final r in matched) r.filePath: r.score};
-      final files = matched.map((r) => File(r.filePath)).toList();
-      debugPrint('[folder] intersection: ${files.length} files');
-      return files;
-    }
-
-    // semantic only - already sorted by score from cosineSearch
-    if (hasText) {
-      _semanticScores = {for (final r in semanticResults) r.filePath: r.score};
-      return semanticResults.map((r) => File(r.filePath)).toList();
-    }
-
-    // tag only
-    _semanticScores = {};
-    return tagPaths.map((p) => File(p)).toList();
+    final paths = await filter.execute(rootPath);
+    debugPrint('[folder] filter returned ${paths.length} paths');
+    return paths.map((p) => File(p)).toList();
   }
 
   @override
@@ -417,11 +370,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           future: _entitiesFuture,
           builder: (context, entitiesSnapshot) => FutureBuilder<Set<String>>(
             future: _indexedFilesFuture,
-            builder: (context, indexedSnapshot) =>
-                FutureBuilder<Map<String, String>>(
-                  future: _embeddingFailuresFuture,
-                  builder: (context, failuresSnapshot) => SilkyScroll(
-                    builder: (context, controller, physics, pointerDeviceKind) {
+            builder: (context, indexedSnapshot) => SilkyScroll(
+              builder: (context, controller, physics, pointerDeviceKind) {
                       if (entitiesSnapshot.hasError) {
                         return Center(
                           child: Text("Error: ${entitiesSnapshot.error}"),
@@ -441,14 +391,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                               final aIsDir = FileManager.isDirectory(a);
                               final bIsDir = FileManager.isDirectory(b);
                               if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-
-                              // sort by semantic score when available
-                              if (_semanticScores.isNotEmpty) {
-                                final aScore = _semanticScores[a.path] ?? 0.0;
-                                final bScore = _semanticScores[b.path] ?? 0.0;
-                                return bScore.compareTo(aScore);
-                              }
-
                               return FileManager.basename(
                                 a,
                               ).toLowerCase().compareTo(
@@ -476,7 +418,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                       }
 
                       final indexedFiles = indexedSnapshot.data ?? {};
-                      final embeddingFailures = failuresSnapshot.data ?? {};
                       final zoom = 0.75 + (widget.folderScale * 1.25);
                       final listColumns = 1 + (widget.folderScale * 3).round();
                       final gridCellWidth = 88.0 * zoom;
@@ -511,10 +452,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                                   !isDir &&
                                   (isFiltering ||
                                       indexedFiles.contains(e.path)),
-                              embedFailure: isDir
-                                  ? null
-                                  : embeddingFailures[e.path],
-                              matchScore: _semanticScores[e.path],
                               iconSize: iconSize,
                               gridWidth: gridCellWidth,
                               labelSize: labelSize,
@@ -543,7 +480,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                                   !isDir &&
                                   (isFiltering ||
                                       indexedFiles.contains(e.path)),
-                              matchScore: _semanticScores[e.path],
                               iconSize: listIconSize,
                             );
                           },
@@ -551,118 +487,100 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                       }
                     },
                   ),
-                ),
+            ),
           ),
         ),
-      ),
-      floatingActionButton: Builder(
-        builder: (context) {
-          final hasModel = DownloadManager.instance.getInstalledModels().isNotEmpty;
-          return Tooltip(
-            message: hasModel
-                ? 'Index folder + generate embeddings'
-                : 'Install an embedding model in Runtime Manager first',
-            child: IconButton(
-              style: ButtonStyle(
-                backgroundColor: WidgetStatePropertyAll(
-                  hasModel ? cs.primary : cs.surfaceContainerHighest,
-                ),
-                padding: WidgetStatePropertyAll(.all(16)),
-              ),
-              hoverColor: hasModel ? cs.primaryContainer : null,
-              onPressed: hasModel
-                  ? () async {
-                      if (isReindexing.value) {
-                        _cancelToken?.cancel();
-                        return;
-                      }
-                      _cancelToken = CancellationToken();
-                      isReindexing.value = true;
-                      indexProgress.value = 0;
-                      await indexDirectory(
-                        widget.currentPath,
-                        onProgress: (p) => indexProgress.value = p,
-                        cancelToken: _cancelToken,
-                      );
-                      setState(() {
-                        _indexedFilesFuture = getIndexedFiles(
-                          widget.currentPath,
-                        );
-                      });
-                      indexProgress.value = 0;
-                      isReindexing.value = false;
-                    }
-                  : null,
-              icon: ValueListenableBuilder(
-                valueListenable: isReindexing,
-                builder: (context, value, child) => AnimatedSwitcher(
-                  duration: Duration(milliseconds: 500),
-                  child: isReindexing.value
-                      ? ValueListenableBuilder<double>(
-                          key: const ValueKey("loading"),
-                          valueListenable: indexProgress,
-                          builder: (context, progress, _) {
-                            return SizedBox(
-                              height: 36,
-                              width: 36,
-                              child: Stack(
-                                alignment: Alignment.center,
-                                children: [
-                                  SizedBox(
-                                    height: 36,
-                                    width: 36,
-                                    child: CircularProgressIndicator(
-                                      value: progress > 0 ? progress : null,
-                                      color: readableOn(
-                                        Theme.of(context).colorScheme.primary,
-                                      ),
-                                      strokeWidth: 3,
-                                    ),
+      floatingActionButton: Tooltip(
+        message: 'Re-index current folder',
+        child: IconButton(
+          style: ButtonStyle(
+            backgroundColor: WidgetStatePropertyAll(cs.primary),
+            padding: WidgetStatePropertyAll(EdgeInsets.all(16)),
+          ),
+          hoverColor: cs.primaryContainer,
+          onPressed: isReindexing.value
+              ? () {
+                  _cancelToken?.cancel();
+                }
+              : () async {
+                  _cancelToken = CancellationToken();
+                  isReindexing.value = true;
+                  indexProgress.value = 0;
+                  await indexDirectory(
+                    widget.currentPath,
+                    onProgress: (p) => indexProgress.value = p,
+                    cancelToken: _cancelToken,
+                  );
+                  setState(() {
+                    _indexedFilesFuture = getIndexedFiles(
+                      widget.currentPath,
+                    );
+                  });
+                  indexProgress.value = 0;
+                  isReindexing.value = false;
+                },
+          icon: ValueListenableBuilder(
+            valueListenable: isReindexing,
+            builder: (context, value, child) => AnimatedSwitcher(
+              duration: Duration(milliseconds: 500),
+              child: isReindexing.value
+                  ? ValueListenableBuilder<double>(
+                      key: const ValueKey("loading"),
+                      valueListenable: indexProgress,
+                      builder: (context, progress, _) {
+                        return SizedBox(
+                          height: 36,
+                          width: 36,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              SizedBox(
+                                height: 36,
+                                width: 36,
+                                child: CircularProgressIndicator(
+                                  value: progress > 0 ? progress : null,
+                                  color: readableOn(
+                                    Theme.of(context).colorScheme.primary,
                                   ),
-                                  Icon(
-                                    Icons.close,
-                                    size: 16,
-                                    color: readableOn(
-                                      Theme.of(context).colorScheme.primary,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
-                        )
-                      : Row(
-                          key: const ValueKey("idle"),
-                          mainAxisSize: .min,
-                          spacing: 10,
-                          children: [
-                            Icon(
-                              hasModel
-                                  ? Icons.refresh
-                                  : Icons.warning_amber_rounded,
-                              color: readableOn(
-                                hasModel ? cs.primary : cs.onSurfaceVariant,
-                              ),
-                              size: hasModel ? 26 : 22,
-                            ),
-                            Text(
-                              hasModel ? "index" : "no model",
-                              maxLines: 1,
-                              style: TextStyle(
-                                color: readableOn(
-                                  hasModel ? cs.primary : cs.onSurfaceVariant,
+                                  strokeWidth: 3,
                                 ),
-                                fontSize: 18,
                               ),
-                            ),
-                            SizedBox(width: 4),
-                          ],
+                              Icon(
+                                Icons.close,
+                                size: 16,
+                                color: readableOn(
+                                  Theme.of(context).colorScheme.primary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    )
+                  : Row(
+                      key: const ValueKey("idle"),
+                      mainAxisSize: MainAxisSize.min,
+                      spacing: 10,
+                      children: [
+                        Icon(
+                          Icons.refresh,
+                          color: readableOn(cs.primary),
+                          size: 26,
                         ),
-                ),
-              ),
+                        Text(
+                          "index",
+                          maxLines: 1,
+                          style: TextStyle(
+                            color: readableOn(cs.primary),
+                            fontSize: 18,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                      ],
+                    ),
             ),
-          );
-        },
+          ),
+        ),
       ),
     );
   }
@@ -674,8 +592,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
-    String? embedFailure,
-    double? matchScore,
     required double iconSize,
     required double gridWidth,
     required double labelSize,
@@ -709,8 +625,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     size: iconSize * 1.35,
                     iconSize: iconSize,
                     isIndexed: isIndexed,
-                    embedFailure: embedFailure,
-                    matchScore: matchScore,
                   ),
                   const SizedBox(height: 4),
                   Expanded(
@@ -738,7 +652,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
-    double? matchScore,
     required double iconSize,
   }) {
     return MouseRegion(
@@ -763,7 +676,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 size: iconSize * 1.45,
                 iconSize: iconSize,
                 isIndexed: isIndexed,
-                matchScore: matchScore,
               ),
               title: Text(
                 FileManager.basename(entity),
@@ -782,8 +694,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required FileSystemEntity entity,
     required bool isDir,
     required bool isIndexed,
-    String? embedFailure,
-    double? matchScore,
     required double size,
     required double iconSize,
   }) {
@@ -829,39 +739,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
         _PreviewKind.file => Icon(Icons.insert_drive_file, size: iconSize),
       },
     );
-
-    if (embedFailure != null) {
-      return Tooltip(
-        message: embedFailure,
-        child: SizedBox.square(
-          dimension: size,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [preview, const _EmbedFailureBadge()],
-          ),
-        ),
-      );
-    }
-
-    // score bar - show on top of everything
-    if (matchScore != null && matchScore > 0) {
-      return SizedBox.square(
-        dimension: size,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            preview,
-            if (isIndexed) const _IndexedBadge(),
-            Positioned(
-              left: 4,
-              right: 4,
-              top: 4,
-              child: _ScoreBar(score: matchScore),
-            ),
-          ],
-        ),
-      );
-    }
 
     if (isIndexed) {
       return SizedBox.square(
@@ -1087,68 +964,6 @@ class _IndexedBadge extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(2),
           child: Icon(Icons.check, color: Colors.white, size: 10),
-        ),
-      ),
-    );
-  }
-}
-
-class _EmbedFailureBadge extends StatelessWidget {
-  const _EmbedFailureBadge();
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      bottom: 2,
-      right: 2,
-      child: DecoratedBox(
-        decoration: const BoxDecoration(
-          color: Colors.red,
-          shape: BoxShape.circle,
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(2),
-          child: Icon(Icons.close, color: Colors.white, size: 10),
-        ),
-      ),
-    );
-  }
-}
-
-class _ScoreBar extends StatelessWidget {
-  const _ScoreBar({required this.score});
-  final double score;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = score >= 0.6
-        ? Theme.of(context).colorScheme.primary
-        : Theme.of(context).colorScheme.error;
-    return Tooltip(
-      message: '${(score * 100).toStringAsFixed(0)}% match',
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(2),
-        child: SizedBox(
-          height: 8,
-          child: Stack(
-            children: [
-              Container(
-                decoration: BoxDecoration(
-                  color: Colors.black.withAlpha(100),
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-              FractionallySizedBox(
-                widthFactor: score.clamp(0.0, 1.0),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: color,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-            ],
-          ),
         ),
       ),
     );

@@ -46,3 +46,4 @@ app.*.map.json
 
 # Semantic search models
 /searchmodels/
+.codex.md

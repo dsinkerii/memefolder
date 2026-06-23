@@ -61,8 +61,6 @@ final List<({String tag, Color color, String label})> _allTags = [
   (tag: '@height<', color: Color(0xFFFFB30B), label: 'logical'),
   (tag: '@fps>', color: Color(0xFFFFB30B), label: 'logical'),
   (tag: '@fps<', color: Color(0xFFFFB30B), label: 'logical'),
-  (tag: '@score>', color: Color(0xFFFFB30B), label: 'logical'),
-  (tag: '@score<', color: Color(0xFFFFB30B), label: 'logical'),
 ];
 
 final List<({String tag, Color color, String label})> _allOperators = [
@@ -80,7 +78,6 @@ final List<({Color color, String label})> _legendEntries = [
   (color: Color(0xFFFFB30B), label: 'logical'),
   (color: Color(0xFF9436A6), label: 'custom'),
   (color: Color(0xFF4EB8A0), label: 'folder'),
-  (color: Color(0xFF00BCD4), label: 'semantic'),
   (color: Color(0xFFAE4393), label: 'and'),
   (color: Color(0xFF8AD4E4), label: 'or'),
   (color: Color(0xFFB01B00), label: 'not'),
@@ -339,9 +336,8 @@ class _ContextBarFieldState extends State<_ContextBarField> {
     final text = searchController.text.trim();
     debugPrint('[ctxbar] _applyFilter text="$text"');
     FilterService.instance.setQuery(text);
-    // _getFilteredEntities in folder_view handles semantic + tag AND logic
+    _removeSuggestions();
   }
-  // build
 
   @override
   Widget build(BuildContext context) {
@@ -370,6 +366,21 @@ class _ContextBarFieldState extends State<_ContextBarField> {
                           _removeSuggestions();
                           FilterService.instance.clear();
                         },
+                      )
+                    : SizedBox.shrink();
+              },
+            ),
+            suffixIcon: ValueListenableBuilder(
+              valueListenable: widget.controller,
+              builder: (context, value, child) {
+                return widget.controller.text.isNotEmpty
+                    ? IconButton(
+                        icon: Icon(Icons.search,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withAlpha(160)),
+                        onPressed: () => _applyFilter(widget.controller.text),
                       )
                     : SizedBox.shrink();
               },
@@ -501,29 +512,6 @@ final regexTokens = RegExp(
     tokens.add(Token(TokText(), text.substring(cursor)));
   }
 
-  // if no tag/operator tokens exist, mark all text as semantic
-  final hasTagOrOp = tokens.any(
-    (t) =>
-        t.type is TokTagFiletype ||
-        t.type is TokTagFileext ||
-        t.type is TokTagFolder ||
-        t.type is TokTagModality ||
-        t.type is TokTagLogical ||
-        t.type is TokOpAnd ||
-        t.type is TokOpOr ||
-        t.type is TokOpNot ||
-        t.type is TokOpBracket,
-  );
-
-  if (!hasTagOrOp && tokens.isNotEmpty) {
-    return tokens.map((t) {
-      if (t.type is TokText) {
-        return Token(TokSemanticText(), t.value);
-      }
-      return t;
-    }).toList();
-  }
-
   return tokens;
 }
 
@@ -615,11 +603,6 @@ class TokOpBracket extends TokenType {
 class TokEscaped extends TokenType {
   @override
   final TextStyle style = _squiggly(Color(0xFF6E6E7A));
-}
-
-class TokSemanticText extends TokenType {
-  @override
-  final TextStyle style = const TextStyle();
 }
 
 // autocomplete popup

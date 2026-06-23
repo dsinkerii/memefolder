@@ -98,7 +98,13 @@ class PlayerPrefs {
       return List<String>.from(_cache[key] as List);
     }
 
-    final val = _prefs.getStringList(key);
+    List<String>? val;
+    try {
+      val = _prefs.getStringList(key);
+    } catch (_) {
+      _prefs.remove(key);
+    }
+
     if (val != null) {
       _cache[key] = val;
     }
@@ -152,8 +158,6 @@ class PlayerPrefs {
 
     return val ?? defValue;
   }
-
-  static const String gpuAccelerationKey = 'gpu_acceleration';
 
   static bool getBool(String key, bool defValue) {
     if (_cache.containsKey(key)) {
