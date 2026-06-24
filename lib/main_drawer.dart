@@ -3,6 +3,7 @@ import 'package:flutter_vector_icons/flutter_vector_icons.dart';
 import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/custom_tags_dialog.dart';
+import 'package:memefolder/widgets/model_manager.dart';
 import 'package:memefolder/widgets/runtime_manager.dart';
 import 'package:provider/provider.dart';
 
@@ -34,6 +35,14 @@ Widget buildDrawer(BuildContext context) {
           onTap: () {
             Navigator.of(context).pop();
             showRuntimeManagerDialog(context);
+          },
+        ),
+        ListTile(
+          leading: Icon(Icons.model_training),
+          title: Text("models"),
+          onTap: () {
+            Navigator.of(context).pop();
+            showModelManagerDialog(context);
           },
         ),
       ],

@@ -16,6 +16,7 @@ final List<({String tag, Color color, String label})> _allTags = [
   (tag: '@photo', color: Color(0xFFB1F024), label: 'type'),
   (tag: '@audio', color: Color(0xFFB1F024), label: 'type'),
   (tag: '@sound', color: Color(0xFFB1F024), label: 'type'),
+  (tag: '@text', color: Color(0xFFB1F024), label: 'type'),
 
   (tag: '@.mp4', color: Color(0xFF55AFD4), label: 'ext'),
   (tag: '@.jpg', color: Color(0xFF55AFD4), label: 'ext'),
@@ -61,6 +62,12 @@ final List<({String tag, Color color, String label})> _allTags = [
   (tag: '@height<', color: Color(0xFFFFB30B), label: 'logical'),
   (tag: '@fps>', color: Color(0xFFFFB30B), label: 'logical'),
   (tag: '@fps<', color: Color(0xFFFFB30B), label: 'logical'),
+  (tag: '@score>', color: Color(0xFFFFB30B), label: 'logical'),
+  (tag: '@score<', color: Color(0xFFFFB30B), label: 'logical'),
+  (tag: '@score=', color: Color(0xFFFFB30B), label: 'logical'),
+
+  (tag: '@imagecontent', color: Color(0xFF9436A6), label: 'mode'),
+  (tag: '@audiocontent', color: Color(0xFF9436A6), label: 'mode'),
 ];
 
 final List<({String tag, Color color, String label})> _allOperators = [
@@ -454,6 +461,7 @@ final regexTokens = RegExp(
     r'|(&)' // 5. and
     r'|(\|)' // 6. or
     r'|(@\.[a-zA-Z0-9]{2,4}(?=\s|$|[&|!()]))' // 7. extension
+    r'|(@(?:audiocontent|imagecontent))' // 7b. content mode toggles
     r'|(@(?:video|gif|picture|image|photo|audio|sound))' // 8. filetype
     r'|(@date[><=:][^\s@&|!()]+)' // 9. date logical
     r'|(@date\?[0-9]{4}(?:[\d.]*))' // 9b. date format: @date?YYYY, @date?MM.YYYY, @date?DD.MM.YYYY
@@ -487,15 +495,17 @@ final regexTokens = RegExp(
     } else if (match.group(7) != null) {
       type = TokTagFileext();
     } else if (match.group(8) != null) {
-      type = TokTagFiletype();
-    } else if (match.group(9) != null || match.group(10) != null) {
       type = TokTagLogical();
-    } else if (match.group(11) != null) {
+    } else if (match.group(9) != null) {
+      type = TokTagFiletype();
+    } else if (match.group(10) != null || match.group(11) != null) {
       type = TokTagLogical();
     } else if (match.group(12) != null) {
+      type = TokTagLogical();
+    } else if (match.group(13) != null) {
       final slug = g.substring(1);
       type = _folderPathRegex.hasMatch(slug) ? TokTagFolder() : TokTagInvalid();
-    } else if (match.group(13) != null) {
+    } else if (match.group(14) != null) {
       final word = g.startsWith('@')
           ? g.substring(1).toLowerCase()
           : g.toLowerCase();

@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -shared -Wl,--dependency-file=CMakeFiles/mel_ffi.dir/link.d -Wl,-soname,libmel_ffi.so -o libmel_ffi.so CMakeFiles/mel_ffi.dir/mel_ffi.c.o  -lm

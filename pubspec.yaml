@@ -53,6 +53,10 @@ dependencies:
   path: ^1.9.1
   sqflite_common_ffi: any
   dotted_border: ^3.1.0
+  onnxruntime_v2: ^1.23.2+2
+  path_provider: ^2.1.6
+  ffi: ^2.2.0
+  http: ^1.2.0
 
 
 

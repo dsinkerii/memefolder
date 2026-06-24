@@ -1,11 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:just_audio/just_audio.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/backend/custom_tags_store.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
+
+import 'embedding_service.dart';
+import 'tokenizer.dart';
 
 final _player = AudioPlayer();
 final _warnplayer = AudioPlayer();
@@ -16,7 +20,20 @@ class CancellationToken {
   void cancel() => _cancelled = true;
 }
 
-Future<void> indexDirectory(
+class IndexResult {
+  final int totalFiles;
+  final int indexedOk;
+  final int indexedFail;
+  final int skipped;
+  IndexResult({
+    required this.totalFiles,
+    required this.indexedOk,
+    required this.indexedFail,
+    required this.skipped,
+  });
+}
+
+Future<IndexResult> indexDirectory(
   String currentPath, {
   void Function(double progress)? onProgress,
   CancellationToken? cancelToken,
@@ -51,7 +68,7 @@ Future<void> indexDirectory(
     final totalCount = await _countFiles(currentPath);
 
     await _initDB(currentPath, dbPath: tmpPath);
-    await _scanAndIndex(
+    final result = await _scanAndIndex(
       currentPath,
       dbPath: tmpPath,
       totalCount: totalCount,
@@ -81,7 +98,7 @@ Future<void> indexDirectory(
           ],
         ),
       );
-      return;
+      return result;
     }
 
     if (dbExists) {
@@ -90,6 +107,31 @@ Future<void> indexDirectory(
     await File(tmpPath).rename(dbPath);
 
     onProgress?.call(1.0);
+
+    showBubble(
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            result.indexedFail > 0 ? Icons.warning : Icons.check_circle,
+            color: Colors.white,
+          ),
+          const SizedBox(width: 12),
+          Text(
+            '${result.indexedOk} ok, ${result.indexedFail} fail, ${result.skipped} skip',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        ],
+      ),
+    );
+
+    return result;
   } catch (e) {
     await _cleanupTmp(tmpPath);
     rethrow;
@@ -123,21 +165,37 @@ Future<void> _initDB(String currentPath, {required String dbPath}) async {
   await db.close();
 }
 
-Future<Set<String>> getIndexedFiles(String rootPath) async {
+class IndexStatus {
+  final Set<String> indexed;
+  final Set<String> failed;
+  const IndexStatus({this.indexed = const {}, this.failed = const {}});
+}
+
+Future<IndexStatus> getIndexedFiles(String rootPath) async {
   final dbPath = p.join(rootPath, '.memefolder.db');
-  if (!File(dbPath).existsSync()) return {};
+  if (!File(dbPath).existsSync()) return const IndexStatus();
 
   try {
     final db = await openDatabase(dbPath, singleInstance: false);
-    final results = await db.rawQuery('SELECT rel_path FROM files');
+    final results = await db.rawQuery(
+      "SELECT rel_path, status FROM files WHERE media_type IN ('image','video','audio')",
+    );
     await db.close();
-    return results.map((r) {
-      final relPath = r['rel_path'] as String;
-      return p.join(rootPath, relPath);
-    }).toSet();
+    final indexed = <String>{};
+    final failed = <String>{};
+    for (final r in results) {
+      final relPath = p.join(rootPath, r['rel_path'] as String);
+      final status = r['status'] as String? ?? 'indexed';
+      if (status == 'embed_failed') {
+        failed.add(relPath);
+      } else {
+        indexed.add(relPath);
+      }
+    }
+    return IndexStatus(indexed: indexed, failed: failed);
   } catch (e) {
     debugPrint('Error reading indexed files: $e');
-    return {};
+    return const IndexStatus();
   }
 }
 
@@ -189,12 +247,23 @@ const _audioExts = {
   'alac',
 };
 
+const _textExts = {
+  'txt',
+  'srt',
+  'sub',
+  'vtt',
+  'ass',
+  'ssa',
+  'md',
+};
+
 String _mediaTypeForExt(String? ext) {
   if (ext == null) return 'unknown';
   final e = ext.toLowerCase();
   if (_imageExts.contains(e)) return 'image';
   if (_videoExts.contains(e)) return 'video';
   if (_audioExts.contains(e)) return 'audio';
+  if (_textExts.contains(e)) return 'text';
   return 'unknown';
 }
 
@@ -251,7 +320,7 @@ Future<int> _countFiles(String rootPath) async {
   return count;
 }
 
-Future<void> _scanAndIndex(
+Future<IndexResult> _scanAndIndex(
   String rootPath, {
   required String dbPath,
   int totalCount = 0,
@@ -261,6 +330,8 @@ Future<void> _scanAndIndex(
   final db = await openDatabase(dbPath);
 
   var indexedCount = 0;
+  var embedOk = 0;
+  var embedFail = 0;
 
   // small in-memory caches to avoid hammering SQLite
   final folderIdByRelPath = <String, int>{};
@@ -356,6 +427,9 @@ Future<void> _scanAndIndex(
     );
   }
 
+  // Collect files needing embedding (processed after transaction)
+  final embedQueue = <_EmbedJob>[];
+
   Future<void> scanFolder(Transaction txn, String relPath, int depth) async {
     if (depth > 5) return; // cap at depth 5
     await _player.setAsset('Assets/SFX/done.mp3');
@@ -396,6 +470,8 @@ Future<void> _scanAndIndex(
         final ext = p.extension(name).toLowerCase().replaceFirst('.', '');
         final stem = p.basenameWithoutExtension(name);
         final mediaType = _mediaTypeForExt(ext);
+        // Only index images, videos, and audio. No text/docs/models/apps.
+        if (mediaType == 'unknown' || mediaType == 'text') continue;
 
         Map<String, String?> audioMeta = {};
         if (mediaType == 'audio') {
@@ -473,6 +549,12 @@ Future<void> _scanAndIndex(
               await attachTag(txn, fileId, tagId, 'system');
               break;
             }
+          case 'text':
+            {
+              final tagId = await ensureTag(txn, 'text', '@text', 'type');
+              await attachTag(txn, fileId, tagId, 'system');
+              break;
+            }
         }
 
         if (ext.isNotEmpty) {
@@ -481,6 +563,14 @@ Future<void> _scanAndIndex(
           final tagId = await ensureTag(txn, slug, display, 'ext');
           await attachTag(txn, fileId, tagId, 'system');
         }
+
+        embedQueue.add(_EmbedJob(
+          fileId: fileId,
+          absPath: entity.path,
+          mediaType: mediaType,
+          audioMeta: audioMeta,
+          fileName: stem,
+        ));
       }
     }
   }
@@ -492,7 +582,21 @@ Future<void> _scanAndIndex(
   });
 
   await db.close();
-  await _congratulateScanEnd(); // awesome!! we're done
+
+  if (EmbeddingService.instance.isInitialized && embedQueue.isNotEmpty) {
+    final (ok, fail) = await _processEmbedQueue(dbPath, embedQueue, onProgress, cancelToken);
+    embedOk += ok;
+    embedFail += fail;
+  }
+
+  await _congratulateScanEnd();
+
+  return IndexResult(
+    totalFiles: indexedCount,
+    indexedOk: embedOk,
+    indexedFail: embedFail,
+    skipped: indexedCount - embedOk - embedFail,
+  );
 }
 
 Future<void> _congratulateScanEnd() async {
@@ -578,7 +682,11 @@ Future<void> _createSchema(Database db, String currentPath) async {
       comment TEXT,
       track TEXT,
       indexed_at INTEGER,
-      status TEXT NOT NULL DEFAULT 'indexed'
+      status TEXT NOT NULL DEFAULT 'indexed',
+      clip_emb BLOB,
+      clap_emb BLOB,
+      metadata_emb BLOB,
+      metadata_text TEXT
     );
   ''');
 
@@ -675,7 +783,7 @@ Future<void> _createSchema(Database db, String currentPath) async {
     'model_tier': 'low',
     'model_name': 'clip-vit-b32',
     'app_version': null,
-    'schema_version': 1,
+    'schema_version': 2,
   });
 
   await db.insert('folders', {
@@ -910,4 +1018,225 @@ Future<List<String>> getAvailableTags(String rootPath) async {
 
   final sorted = allTags.toList()..sort();
   return sorted;
+}
+
+class _EmbedJob {
+  final int fileId;
+  final String absPath;
+  final String mediaType;
+  final Map<String, String?> audioMeta;
+  final String fileName;
+  const _EmbedJob({
+    required this.fileId,
+    required this.absPath,
+    required this.mediaType,
+    required this.audioMeta,
+    required this.fileName,
+  });
+}
+
+Future<(int, int)> _processEmbedQueue(
+  String dbPath,
+  List<_EmbedJob> queue,
+  void Function(double progress)? onProgress,
+  CancellationToken? cancelToken,
+) async {
+  final svc = EmbeddingService.instance;
+  final tokenizer = HuggingFaceTokenizer.fromFile(
+    '${svc.modelsPath}/clip/tokenizer.json',
+  );
+  final db = await openDatabase(dbPath);
+  var done = 0;
+  var ok = 0;
+  var fail = 0;
+
+  try {
+    for (final job in queue) {
+      if (cancelToken?.isCancelled ?? false) break;
+      try {
+        await _embedOneFile(db, svc, tokenizer, job);
+        ok++;
+      } catch (e) {
+        fail++;
+        debugPrint('[embed] error for ${job.absPath}: $e');
+        // mark file status as 'embed_failed' so UI can show X
+        try {
+          await db.update('files', {'status': 'embed_failed'}, where: 'id = ?', whereArgs: [job.fileId]);
+        } catch (_) {}
+      }
+      done++;
+      if (queue.length > 1) {
+        onProgress?.call(done / queue.length);
+      }
+    }
+  } finally {
+    await db.close();
+  }
+  return (ok, fail);
+}
+
+Future<void> _embedOneFile(
+  Database db,
+  EmbeddingService svc,
+  HuggingFaceTokenizer tokenizer,
+  _EmbedJob job,
+) async {
+  final updates = <String, Object?>{};
+  final clipEmb = await _embedClipForFile(svc, tokenizer, job);
+  if (clipEmb != null && clipEmb.length == svc.clipDim) {
+    updates['clip_emb'] = clipEmb.buffer.asUint8List();
+  }
+
+  final clapEmb = await _embedClapForFile(svc, job);
+  if (clapEmb != null && clapEmb.length == svc.clapDim) {
+    updates['clap_emb'] = clapEmb.buffer.asUint8List();
+  }
+
+  final textEmb = await _embedTextForFile(svc, tokenizer, job);
+  if (textEmb != null && textEmb.length == svc.clipDim) {
+    updates['clip_emb'] = textEmb.buffer.asUint8List();
+  }
+
+  final metadataResult = await _embedMetadata(svc, tokenizer, job);
+  if (metadataResult != null && metadataResult.$1.length == svc.clipDim) {
+    updates['metadata_emb'] = metadataResult.$1.buffer.asUint8List();
+    updates['metadata_text'] = metadataResult.$2;
+  }
+
+  if (updates.isNotEmpty) {
+    await db.update('files', updates, where: 'id = ?', whereArgs: [job.fileId]);
+  }
+}
+
+/// Compute CLIP text embedding for text/subtitle files.
+Future<Float32List?> _embedTextForFile(
+  EmbeddingService svc,
+  HuggingFaceTokenizer tokenizer,
+  _EmbedJob job,
+) async {
+  if (job.mediaType != 'text') return null;
+  try {
+    final content = await File(job.absPath).readAsString();
+    final truncated = content.length > 1000 ? content.substring(0, 1000) : content;
+    final tokenIds = tokenizer.encodeClip(truncated);
+    return svc.embedClipText(tokenIds);
+  } catch (e) {
+    debugPrint('[embed] text embedding failed for ${job.absPath}: $e');
+    return null;
+  }
+}
+
+/// Compute CLIP vision embedding for image/video files.
+Future<Float32List?> _embedClipForFile(
+  EmbeddingService svc,
+  HuggingFaceTokenizer tokenizer,
+  _EmbedJob job,
+) async {
+  if (job.mediaType == 'image') {
+    final bytes = await File(job.absPath).readAsBytes();
+    return svc.embedImage(bytes);
+  }
+  if (job.mediaType == 'video') {
+    // Extract keyframe via ffmpeg
+    final keyframePath = '${job.absPath}.keyframe.jpg';
+    try {
+      await Process.run('ffmpeg', [
+        '-y',
+        '-i', job.absPath,
+        '-vframes', '1',
+        '-s', '224x224',
+        '-f', 'image2',
+        keyframePath,
+      ]);
+      final bytes = await File(keyframePath).readAsBytes();
+      final emb = await svc.embedImage(bytes);
+      return emb;
+    } finally {
+      try {
+        await File(keyframePath).delete();
+      } catch (_) {}
+    }
+  }
+  return null;
+}
+
+/// Compute CLAP audio embedding for audio/video files.
+Future<Float32List?> _embedClapForFile(
+  EmbeddingService svc,
+  _EmbedJob job,
+) async {
+  if (job.mediaType != 'audio' && job.mediaType != 'video') return null;
+
+  final pcmPath = '${job.absPath}.pcm';
+  try {
+    final args = <String>[
+      '-y',
+      '-i', job.absPath,
+      '-acodec', 'pcm_s16le',
+      '-ar', '48000',
+      '-ac', '1',
+      '-f', 's16le',
+    ];
+    if (job.mediaType == 'video') {
+      args.insertAll(1, ['-vn']);
+    }
+    args.add(pcmPath);
+    await Process.run('ffmpeg', args);
+
+    final pcmBytes = await File(pcmPath).readAsBytes();
+    final samples = Int16List.view(pcmBytes.buffer);
+    final floatPcm = Float32List(samples.length);
+    for (int i = 0; i < samples.length; i++) {
+      floatPcm[i] = samples[i] / 32768.0;
+    }
+    return svc.embedAudio(floatPcm);
+  } finally {
+    try {
+      await File(pcmPath).delete();
+    } catch (_) {}
+  }
+}
+
+/// Build metadata text and embed via CLIP text encoder.
+/// Returns (embedding, metadata_text) or null.
+Future<(Float32List, String)?> _embedMetadata(
+  EmbeddingService svc,
+  HuggingFaceTokenizer tokenizer,
+  _EmbedJob job,
+) async {
+  final parts = <String>[];
+  parts.add('file: ${job.fileName}');
+
+  if (job.mediaType == 'audio') {
+    final meta = job.audioMeta;
+    if (meta['artist'] != null && meta['artist']!.isNotEmpty) {
+      parts.add('artist: ${meta['artist']}');
+    }
+    if (meta['album'] != null && meta['album']!.isNotEmpty) {
+      parts.add('album: ${meta['album']}');
+    }
+    if (meta['genre'] != null && meta['genre']!.isNotEmpty) {
+      parts.add('genre: ${meta['genre']}');
+    }
+    if (meta['year'] != null && meta['year']!.isNotEmpty) {
+      parts.add('year: ${meta['year']}');
+    }
+    if (meta['track'] != null && meta['track']!.isNotEmpty) {
+      parts.add('track: ${meta['track']}');
+    }
+    if (meta['comment'] != null && meta['comment']!.isNotEmpty) {
+      parts.add('comment: ${meta['comment']}');
+    }
+    if (meta['duration_ms'] != null) {
+      final secs = int.tryParse(meta['duration_ms']!) ?? 0;
+      parts.add('duration: ${(secs / 1000).toStringAsFixed(1)}s');
+    }
+  }
+
+  final metadataText = parts.join(', ');
+  if (metadataText.isEmpty) return null;
+
+  final tokenIds = tokenizer.encodeClip(metadataText);
+  final emb = await svc.embedClipText(tokenIds);
+  return (emb, metadataText);
 }

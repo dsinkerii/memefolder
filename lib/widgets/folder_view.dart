@@ -56,13 +56,12 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   String? _lastPressedPath;
   DateTime? _lastPressedAt;
   late Future<List<FileSystemEntity>> _entitiesFuture;
-  late Future<Set<String>> _indexedFilesFuture;
+  late Future<IndexStatus> _indexedFilesFuture;
   final Map<String, Future<File?>> _videoThumbnailFutures = {};
   ValueNotifier<bool> isReindexing = ValueNotifier(false);
   ValueNotifier<double> indexProgress = ValueNotifier(0.0);
   CancellationToken? _cancelToken;
 
-  // autocomplete state
   List<String> _suggestions = [];
   int _selectedSuggestionIndex = -1;
   final LayerLink _pathBarLink = LayerLink();
@@ -91,9 +90,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   Future<void> _loadData() async {
     final isActive = FilterService.instance.isActive;
     final root = PlayerPrefs.getString("main_folder");
-    debugPrint(
-      '[folder] _loadData isActive=$isActive root="$root" path="${widget.currentPath}"',
-    );
     if (isActive) {
       if (root.isNotEmpty) {
         _entitiesFuture = _getFilteredEntities(root);
@@ -108,14 +104,9 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
 
   Future<List<FileSystemEntity>> _getFilteredEntities(String rootPath) async {
     final filter = FilterService.instance;
-    debugPrint(
-      '[folder] _getFilteredEntities isActive=${filter.isActive} hasTags=${filter.hasTags} query="${filter.query}"',
-    );
-
     if (!filter.isActive) return [];
 
     final paths = await filter.execute(rootPath);
-    debugPrint('[folder] filter returned ${paths.length} paths');
     return paths.map((p) => File(p)).toList();
   }
 
@@ -368,7 +359,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
             "${widget.currentPath}-${widget.isGrid}-${widget.folderScale}",
           ),
           future: _entitiesFuture,
-          builder: (context, entitiesSnapshot) => FutureBuilder<Set<String>>(
+          builder: (context, entitiesSnapshot) => FutureBuilder<IndexStatus>(
             future: _indexedFilesFuture,
             builder: (context, indexedSnapshot) => SilkyScroll(
               builder: (context, controller, physics, pointerDeviceKind) {
@@ -381,24 +372,26 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                         return const Center(child: CircularProgressIndicator());
                       }
 
-                      final entities =
+                      var entities =
                           entitiesSnapshot.data!
                               .where(
                                 (e) => !FileManager.basename(e).startsWith('.'),
                               )
-                              .toList()
-                            ..sort((a, b) {
-                              final aIsDir = FileManager.isDirectory(a);
-                              final bIsDir = FileManager.isDirectory(b);
-                              if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-                              return FileManager.basename(
-                                a,
-                              ).toLowerCase().compareTo(
-                                FileManager.basename(b).toLowerCase(),
-                              );
-                            });
+                              .toList();
 
                       final isFiltering = FilterService.instance.isActive;
+                      if (!isFiltering) {
+                        entities.sort((a, b) {
+                          final aIsDir = FileManager.isDirectory(a);
+                          final bIsDir = FileManager.isDirectory(b);
+                          if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
+                          return FileManager.basename(
+                            a,
+                          ).toLowerCase().compareTo(
+                            FileManager.basename(b).toLowerCase(),
+                          );
+                        });
+                      }
 
                       if (entities.isEmpty) {
                         if (isFiltering) {
@@ -417,7 +410,9 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                         return const Center(child: Text("Empty Directory"));
                       }
 
-                      final indexedFiles = indexedSnapshot.data ?? {};
+                      final indexedStatus = indexedSnapshot.data ?? const IndexStatus();
+                      final indexedFiles = indexedStatus.indexed;
+                      final failedFiles = indexedStatus.failed;
                       final zoom = 0.75 + (widget.folderScale * 1.25);
                       final listColumns = 1 + (widget.folderScale * 3).round();
                       final gridCellWidth = 88.0 * zoom;
@@ -452,6 +447,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                                   !isDir &&
                                   (isFiltering ||
                                       indexedFiles.contains(e.path)),
+                              isFailed: failedFiles.contains(e.path),
                               iconSize: iconSize,
                               gridWidth: gridCellWidth,
                               labelSize: labelSize,
@@ -480,6 +476,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                                   !isDir &&
                                   (isFiltering ||
                                       indexedFiles.contains(e.path)),
+                              isFailed: failedFiles.contains(e.path),
                               iconSize: listIconSize,
                             );
                           },
@@ -515,6 +512,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     _indexedFilesFuture = getIndexedFiles(
                       widget.currentPath,
                     );
+                    _entitiesFuture = Directory(widget.currentPath).list().toList();
                   });
                   indexProgress.value = 0;
                   isReindexing.value = false;
@@ -592,6 +590,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
+    required bool isFailed,
     required double iconSize,
     required double gridWidth,
     required double labelSize,
@@ -622,9 +621,10 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     context: context,
                     entity: entity,
                     isDir: isDir,
-                    size: iconSize * 1.35,
+                    size: iconSize * 1.45,
                     iconSize: iconSize,
                     isIndexed: isIndexed,
+                    isFailed: isFailed,
                   ),
                   const SizedBox(height: 4),
                   Expanded(
@@ -652,6 +652,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required bool isHovered,
     required bool isSelected,
     required bool isIndexed,
+    required bool isFailed,
     required double iconSize,
   }) {
     return MouseRegion(
@@ -676,6 +677,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 size: iconSize * 1.45,
                 iconSize: iconSize,
                 isIndexed: isIndexed,
+                isFailed: isFailed,
               ),
               title: Text(
                 FileManager.basename(entity),
@@ -694,9 +696,15 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required FileSystemEntity entity,
     required bool isDir,
     required bool isIndexed,
+    required bool isFailed,
     required double size,
     required double iconSize,
   }) {
+    final fs = FilterService.instance;
+    final score = fs.scores[entity.path];
+    final clipScore = fs.clipScores[entity.path];
+    final clapScore = fs.clapScores[entity.path];
+
     if (isDir) {
       return ShaderMask(
         blendMode: BlendMode.srcIn,
@@ -740,12 +748,19 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       },
     );
 
-    if (isIndexed) {
+    final badges = <Widget>[];
+    if (isFailed) badges.add(const _FailedBadge());
+    if (isIndexed && !isFailed) badges.add(const _IndexedBadge());
+    if (clipScore != null || clapScore != null) {
+      badges.add(_DualScoreBadge(clip: clipScore, clap: clapScore));
+    }
+
+    if (badges.isNotEmpty) {
       return SizedBox.square(
         dimension: size,
         child: Stack(
           fit: StackFit.expand,
-          children: [preview, const _IndexedBadge()],
+          children: [preview, ...badges.reversed],
         ),
       );
     }
@@ -964,6 +979,91 @@ class _IndexedBadge extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(2),
           child: Icon(Icons.check, color: Colors.white, size: 10),
+        ),
+      ),
+    );
+  }
+}
+
+class _FailedBadge extends StatelessWidget {
+  const _FailedBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      top: 2,
+      right: 2,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.red.shade700,
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+          child: Icon(Icons.close, color: Colors.white, size: 10),
+        ),
+      ),
+    );
+  }
+}
+
+class _DualScoreBadge extends StatelessWidget {
+  final double? clip;
+  final double? clap;
+  const _DualScoreBadge({this.clip, this.clap});
+
+  static Color _bg(double score) {
+    final pct = score.round();
+    if (pct >= 80) return Colors.green.shade700;
+    if (pct >= 65) return Colors.orange.shade700;
+    return Colors.red.shade700;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final chips = <Widget>[];
+    if (clip != null) {
+      chips.add(_Chip(label: 'C${clip!.round()}', color: _bg(clip!)));
+    }
+    if (clap != null) {
+      chips.add(_Chip(label: 'A${clap!.round()}', color: _bg(clap!)));
+    }
+    if (chips.isEmpty) return const SizedBox.shrink();
+    return Positioned(
+      top: 2,
+      left: 2,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: chips,
+      ),
+    );
+  }
+}
+
+class _Chip extends StatelessWidget {
+  final String label;
+  final Color color;
+  const _Chip({required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 2),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 8,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
         ),
       ),
     );

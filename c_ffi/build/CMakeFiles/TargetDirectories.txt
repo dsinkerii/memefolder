@@ -1,0 +1,8 @@
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/mel_ffi.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/test_mel.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/edit_cache.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/rebuild_cache.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/list_install_components.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/install.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/install/local.dir
+/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build/CMakeFiles/install/strip.dir

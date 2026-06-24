@@ -74,6 +74,12 @@ set_target_properties(${BINARY_NAME}
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# Build C FFI library (mel spectrogram for CLAP audio encoder)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../c_ffi" "${CMAKE_BINARY_DIR}/cffi")
+# Install into bundle so the app finds it at runtime (RPATH=$ORIGIN/lib)
+install(TARGETS mel_ffi DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+add_dependencies(${BINARY_NAME} mel_ffi)
+
 
 # === Installation ===
 # By default, "installing" just makes a relocatable bundle in the build
