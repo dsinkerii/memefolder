@@ -1,6 +1,6 @@
 # memefolder
 
-![meme folder logo](Assets/Images/FullLogo.png)
+![meme folder logo](Assets/Images/CroppedLogo.png)
 
 lets you find that *one* specific meme by the context/tags of it.
 
