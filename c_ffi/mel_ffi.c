@@ -71,7 +71,7 @@ static void hann_window(float* win, int n) {
 /* ================================================================
  * CLAP log-mel spectrogram
  * ================================================================ */
-void compute_clap_mel(const float* pcm, int num_samples, float* output) {
+MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* output) {
     float waveform[CLAP_MAX_SAMPLES + CLAP_N_FFT]; /* for center-padded */
     float window[CLAP_N_FFT];
     int i, f, t;
@@ -156,7 +156,7 @@ void compute_clap_mel(const float* pcm, int num_samples, float* output) {
 /* ================================================================
  * CLIP image preprocessing
  * ================================================================ */
-int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output) {
+MEL_FFI_EXPORT int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output) {
     int w, h, channels;
     unsigned char* img = stbi_load_from_memory(image_data, data_len, &w, &h, &channels, 3);
     if (!img) return -1;

@@ -11,6 +11,7 @@ import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/file_badges.dart';
+import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
 
 class FileBrowserPane extends StatefulWidget {
@@ -377,7 +378,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 }
 
                 var entities = entitiesSnapshot.data!
-                    .where((e) => !FileManager.basename(e).startsWith('.'))
+                    .where((e) => !p.basename(e.path).startsWith('.'))
                     .toList();
 
                 final isFiltering = FilterService.instance.isActive;
@@ -386,8 +387,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     final aIsDir = FileManager.isDirectory(a);
                     final bIsDir = FileManager.isDirectory(b);
                     if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-                    return FileManager.basename(a).toLowerCase().compareTo(
-                      FileManager.basename(b).toLowerCase(),
+                    return p.basename(a.path).toLowerCase().compareTo(
+                      p.basename(b.path).toLowerCase(),
                     );
                   });
                 }
@@ -625,7 +626,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                   const SizedBox(height: 4),
                   Expanded(
                     child: Text(
-                      FileManager.basename(entity),
+                      p.basename(entity.path),
                       maxLines: 3,
                       overflow: TextOverflow.ellipsis,
                       textAlign: TextAlign.center,
@@ -676,7 +677,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 isFailed: isFailed,
               ),
               title: Text(
-                FileManager.basename(entity),
+                p.basename(entity.path),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),

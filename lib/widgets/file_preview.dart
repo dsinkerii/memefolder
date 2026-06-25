@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
-
-import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_vector_icons/flutter_vector_icons.dart';
@@ -18,6 +16,7 @@ import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:open_dir/open_dir.dart';
 import 'package:open_file/open_file.dart';
+import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
@@ -44,7 +43,7 @@ class FilePreviewPane extends StatelessWidget {
         ).colorScheme.surfaceContainerHighest.withAlpha(110),
         centerTitle: true,
         title: Text(
-          FileManager.basename(currentFile),
+          p.basename(currentFile?.path ?? ''),
           style: newInputStyle(context).copyWith(
             fontFamily: "Syne",
             fontVariations: [
@@ -329,7 +328,7 @@ class _FileActionButtons extends StatelessWidget {
     final _openDirPlugin = OpenDir();
     await _openDirPlugin.openNativeDir(
       path: dir,
-      highlightedFileName: FileManager.basename(file),
+      highlightedFileName: p.basename(file.path),
     );
   }
 
@@ -624,7 +623,7 @@ class _FileMetadataSection extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final ext = file.path.split('.').last.toLowerCase();
-    final name = FileManager.basename(file);
+    final name = p.basename(file.path);
 
     return FutureBuilder<FileStat>(
       future: file.stat(),
@@ -1669,7 +1668,7 @@ class _AudioPreviewState extends State<_AudioPreview> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final name = FileManager.basename(widget.file);
+    final name = p.basename(widget.file.path);
     final size = widget.file.existsSync() ? widget.file.lengthSync() : 0;
 
     return ListenableBuilder(
@@ -1924,7 +1923,7 @@ class _UnsupportedPreview extends StatelessWidget {
           Icon(Icons.insert_drive_file, size: 64, color: cs.onSurfaceVariant),
           const SizedBox(height: 12),
           Text(
-            FileManager.basename(file),
+            p.basename(file.path),
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
