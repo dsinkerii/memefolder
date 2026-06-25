@@ -118,6 +118,20 @@ install(DIRECTORY "${NATIVE_ASSETS_DIR}"
    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
    COMPONENT Runtime)
 
+# ONNX Runtime GPU provider shared libraries (optional).
+# Download from https://github.com/microsoft/onnxruntime/releases
+# and place in runner/ to enable CUDA/ROCm/TensorRT acceleration.
+set(ORT_GPU_PROVIDERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runner/ort_gpu_providers")
+if(EXISTS "${ORT_GPU_PROVIDERS_DIR}")
+  file(GLOB ORT_GPU_PROVIDERS "${ORT_GPU_PROVIDERS_DIR}/*.so*")
+  install(FILES ${ORT_GPU_PROVIDERS}
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+  message(STATUS "ONNX Runtime GPU providers found, bundling: ${ORT_GPU_PROVIDERS}")
+else()
+  message(STATUS "No ONNX Runtime GPU providers found at ${ORT_GPU_PROVIDERS_DIR} — CPU only")
+endif()
+
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.
 set(FLUTTER_ASSET_DIR_NAME "flutter_assets")

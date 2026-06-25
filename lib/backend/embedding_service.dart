@@ -1,7 +1,8 @@
+import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
+import 'package:memefolder/prefs.dart';
 
 import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 import 'package:path/path.dart' as p;
@@ -30,6 +31,10 @@ class EmbeddingService {
   /// Mid/high tier (ViT-L/14): CLIP=768, CLAP=512.
   int clipDim = 512;
   int get clapDim => 512;
+  String _gpuProvider = 'CPU';
+  String get gpuProvider => _gpuProvider;
+  String? _gpuInitError;
+  String? get gpuInitError => _gpuInitError;
 
   // C FFI for audio preprocessing
   MelFFI? _mel;
@@ -38,16 +43,86 @@ class EmbeddingService {
   String? _modelsPath;
   String get modelsPath => _modelsPath ?? '/tmp/onnx_models';
 
-  Future<void> initialize({String? modelsPath}) async {
+  Timer? _idleTimer;
+  int get _idleTimeoutMinutes =>
+      PlayerPrefs.getInt('model_idle_timeout', 10);
+  String? _lastTier;
+  String? _lastGpuProvider;
+  int? _lastClipDim;
+
+  void _touchIdleTimer() {
+    _idleTimer?.cancel();
+    final minutes = _idleTimeoutMinutes;
+    if (minutes <= 0) return;
+    _idleTimer = Timer(Duration(minutes: minutes), unload);
+  }
+
+  void restartIdleTimer() => _touchIdleTimer();
+
+  Future<void> unload() async {
+    _idleTimer?.cancel();
+    _idleTimer = null;
+    if (!_initialized) return;
+    debugPrint('[embedding] unloading models after idle timeout');
+    await _clapAudio?.release();
+    await _clapText?.release();
+    await _clipVision?.release();
+    await _clipText?.release();
+    _clapAudio = null;
+    _clapText = null;
+    _clipVision = null;
+    _clipText = null;
+    _mel = null;
+    _initialized = false;
+  }
+
+  Future<void> initialize({
+    String? modelsPath,
+    String? gpuProvider,
+    int? clipDim,
+    String? tier,
+  }) async {
     if (_initialized) return;
 
-    _modelsPath = modelsPath ?? await _resolveModelsPath();
+    final base = modelsPath ?? await _resolveModelsPath();
+    _modelsPath = tier != null ? p.join(base, tier) : base;
+    if (clipDim != null) this.clipDim = clipDim;
     _mel = MelFFI();
 
     final options = OrtSessionOptions();
     await options.appendDefaultProviders();
+    if (gpuProvider != null && gpuProvider != 'CPU') {
+      try {
+        switch (gpuProvider) {
+          case 'CUDA':
+            options.appendCudaProvider(CUDAFlags.useNone);
+            break;
+          case 'ROCm':
+            options.appendRocmProvider(ROCmFlags.useNone);
+            break;
+          case 'DirectML':
+            options.appendDirectMLProvider();
+            break;
+          case 'CoreML':
+            options.appendCoreMLProvider(CoreMLFlags.useNone);
+            break;
+          case 'OpenVINO':
+            options.appendOpenVINOProvider();
+            break;
+          case 'TensorRT':
+            options.appendTensorRTProvider();
+            break;
+        }
+        _gpuProvider = gpuProvider;
+      } catch (e) {
+        _gpuInitError = '$e';
+        debugPrint('[embedding] GPU provider $gpuProvider not available: $e');
+      }
+    }
     options.setIntraOpNumThreads(4);
-    options.setSessionGraphOptimizationLevel(GraphOptimizationLevel.ortEnableAll);
+    options.setSessionGraphOptimizationLevel(
+      GraphOptimizationLevel.ortEnableAll,
+    );
 
     // Load models
     _clapAudio = OrtSession.fromFile(
@@ -67,13 +142,18 @@ class EmbeddingService {
       options,
     );
 
+    _lastTier = tier;
+    _lastGpuProvider = gpuProvider;
+    _lastClipDim = clipDim;
     _initialized = true;
+    _touchIdleTimer();
   }
 
   /// Embed audio file → 512d CLAP embedding.
   /// Requires 48kHz mono PCM data.
   Future<Float32List> embedAudio(Float32List pcm48kHz) async {
-    _ensureInitialized();
+    await _ensureInitialized();
+    _touchIdleTimer();
     final mel = _mel!.computeClapMel(pcm48kHz);
     final input = OrtValueTensor.createTensorWithDataList(
       [mel],
@@ -86,11 +166,15 @@ class EmbeddingService {
   /// Embed image bytes → CLIP embedding (clipDim-d).
   /// Handles JPEG, PNG, etc.
   Future<Float32List> embedImage(Uint8List imageBytes) async {
-    _ensureInitialized();
+    await _ensureInitialized();
+    _touchIdleTimer();
 
     // Decode and resize to 224x224
-    final codec = await ui.instantiateImageCodec(imageBytes,
-        targetWidth: 224, targetHeight: 224);
+    final codec = await ui.instantiateImageCodec(
+      imageBytes,
+      targetWidth: 224,
+      targetHeight: 224,
+    );
     final frame = await codec.getNextFrame();
     final bitmap = await frame.image.toByteData(
       format: ui.ImageByteFormat.rawRgba,
@@ -120,47 +204,55 @@ class EmbeddingService {
       [floatData],
       [1, 3, size, size],
     );
-    final outputs =
-        _clipVision!.run(OrtRunOptions(), {'pixel_values': input});
+    final outputs = _clipVision!.run(OrtRunOptions(), {'pixel_values': input});
     return _extractFloat32List(outputs[0] as OrtValueTensor);
   }
 
   /// Embed text → CLIP embedding (clipDim-d, for text queries and text files).
   /// Requires token IDs as Int64List.
   Future<Float32List> embedClipText(Int64List tokenIds) async {
-    _ensureInitialized();
+    await _ensureInitialized();
+    _touchIdleTimer();
     final input = OrtValueTensor.createTensorWithDataList(
       [tokenIds],
       [1, tokenIds.length],
     );
-    final outputs =
-        _clipText!.run(OrtRunOptions(), {'input_ids': input});
+    final outputs = _clipText!.run(OrtRunOptions(), {'input_ids': input});
     return _extractFloat32List(outputs[0] as OrtValueTensor);
   }
 
   /// Embed text → 512d CLAP embedding (for audio-related text queries).
   /// Requires token IDs as Int64List.
   Future<Float32List> embedClapText(Int64List tokenIds) async {
-    _ensureInitialized();
+    await _ensureInitialized();
+    _touchIdleTimer();
     final input = OrtValueTensor.createTensorWithDataList(
       [tokenIds],
       [1, tokenIds.length],
     );
-    final outputs =
-        _clapText!.run(OrtRunOptions(), {'input_ids': input});
+    final outputs = _clapText!.run(OrtRunOptions(), {'input_ids': input});
     return _extractFloat32List(outputs[0] as OrtValueTensor);
   }
 
   /// Copy models from [src] to app support dir
   Future<String> ensureModelsInAppDir({String? src}) async {
-    final dest = p.join((await getApplicationSupportDirectory()).path, 'models');
+    final dest = p.join(
+      (await getApplicationSupportDirectory()).path,
+      'models',
+    );
     final srcPath = src ?? p.join(Directory.current.path, 'searchmodels');
 
     if (await Directory(p.join(dest, 'clip')).exists()) return dest;
 
     try {
-      await _copyDir(Directory(p.join(srcPath, 'clip')), Directory(p.join(dest, 'clip')));
-      await _copyDir(Directory(p.join(srcPath, 'clap')), Directory(p.join(dest, 'clap')));
+      await _copyDir(
+        Directory(p.join(srcPath, 'clip')),
+        Directory(p.join(dest, 'clip')),
+      );
+      await _copyDir(
+        Directory(p.join(srcPath, 'clap')),
+        Directory(p.join(dest, 'clap')),
+      );
       debugPrint('[embedding] models copied to $dest');
     } catch (e) {
       debugPrint('[embedding] failed to copy models: $e');
@@ -177,9 +269,24 @@ class EmbeddingService {
     }
   }
 
-  void _ensureInitialized() {
-    if (!_initialized) throw StateError('EmbeddingService not initialized');
+  Future<void> _ensureInitialized() async {
+    if (_initialized) return;
+    if (_lastTier != null) {
+      await initialize(
+        modelsPath: _modelsPath,
+        tier: _lastTier,
+        gpuProvider: _lastGpuProvider,
+        clipDim: _lastClipDim,
+      );
+    }
+    if (!_initialized) {
+      throw StateError('EmbeddingService not initialized');
+    }
   }
+
+  static int clipDimForTier(String tier) => tier == 'high' ? 768 : 512;
+
+  static Future<String> resolveModelsPath() => _resolveModelsPath();
 
   static Float32List _extractFloat32List(OrtValueTensor tensor) {
     final v = tensor.value;
@@ -209,20 +316,20 @@ class EmbeddingService {
 
 Future<String> _resolveModelsPath() async {
   final candidates = <String>[
-    // development: project root searchmodels/
     p.join(Directory.current.path, 'searchmodels'),
-    // production: app support dir
     p.join((await getApplicationSupportDirectory()).path, 'models'),
   ];
 
   for (final path in candidates) {
+    final lowDir = Directory(p.join(path, 'low'));
+    final highDir = Directory(p.join(path, 'high'));
+    // New tier structure
+    if (await lowDir.exists() || await highDir.exists()) return path;
+    // Legacy flat structure
     final clipDir = Directory(p.join(path, 'clip'));
     final clapDir = Directory(p.join(path, 'clap'));
-    if (await clipDir.exists() && await clapDir.exists()) {
-      return path;
-    }
+    if (await clipDir.exists() && await clapDir.exists()) return path;
   }
 
-  // fallback to app support dir even if models missing
   return p.join((await getApplicationSupportDirectory()).path, 'models');
 }

@@ -20,7 +20,7 @@ class SystemSpecs {
   });
 
   bool get isHighEnd =>
-      vramGb >= 2.0 && ramGb >= 8.0 && cpuClockKhz >= 8000 || cpuCores >= 2;
+      (vramGb >= 2.0 && ramGb >= 8.0 && cpuClockKhz >= 8000) || cpuCores >= 8;
 
   bool get supportsGpuAcceleration => !isIntegratedGpu && vramGb >= 2.0;
 

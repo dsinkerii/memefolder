@@ -2,9 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:just_audio/just_audio.dart';
+import 'package:memefolder/backend/system_specs.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/backend/custom_tags_store.dart';
+import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
 
@@ -247,15 +249,7 @@ const _audioExts = {
   'alac',
 };
 
-const _textExts = {
-  'txt',
-  'srt',
-  'sub',
-  'vtt',
-  'ass',
-  'ssa',
-  'md',
-};
+const _textExts = {'txt', 'srt', 'sub', 'vtt', 'ass', 'ssa', 'md'};
 
 String _mediaTypeForExt(String? ext) {
   if (ext == null) return 'unknown';
@@ -564,13 +558,15 @@ Future<IndexResult> _scanAndIndex(
           await attachTag(txn, fileId, tagId, 'system');
         }
 
-        embedQueue.add(_EmbedJob(
-          fileId: fileId,
-          absPath: entity.path,
-          mediaType: mediaType,
-          audioMeta: audioMeta,
-          fileName: stem,
-        ));
+        embedQueue.add(
+          _EmbedJob(
+            fileId: fileId,
+            absPath: entity.path,
+            mediaType: mediaType,
+            audioMeta: audioMeta,
+            fileName: stem,
+          ),
+        );
       }
     }
   }
@@ -583,10 +579,93 @@ Future<IndexResult> _scanAndIndex(
 
   await db.close();
 
-  if (EmbeddingService.instance.isInitialized && embedQueue.isNotEmpty) {
-    final (ok, fail) = await _processEmbedQueue(dbPath, embedQueue, onProgress, cancelToken);
-    embedOk += ok;
-    embedFail += fail;
+  if (embedQueue.isNotEmpty) {
+    if (!EmbeddingService.instance.isInitialized) {
+      await _autoInitEmbedding();
+      final specs = await SystemSpecs.detect();
+      final gpuProvider = specs.recommendedGpuProvider;
+      final gpuErr = EmbeddingService.instance.gpuInitError;
+      if (gpuProvider != 'CPU' && gpuErr != null) {
+        showBubble(
+          Flexible(
+            child: Text(
+              "Loaded! (CPU only. GPU acceleration failed:\n$gpuErr)",
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                decoration: TextDecoration.none,
+              ),
+              softWrap: true,
+            ),
+          ),
+        );
+      } else {
+        if (gpuProvider == 'CPU') {
+          showBubble(
+            Flexible(
+              child: Text(
+                "Loaded! (CPU only)",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ),
+          );
+        } else {
+          showBubble(
+            Flexible(
+              child: Text(
+                "Loaded! (GPU: $gpuProvider)",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ),
+          );
+        }
+      }
+    }
+    if (EmbeddingService.instance.isInitialized) {
+      final (ok, fail) = await _processEmbedQueue(
+        dbPath,
+        embedQueue,
+        onProgress,
+        cancelToken,
+      );
+      embedOk += ok;
+      embedFail += fail;
+    } else {
+      showBubble(
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline),
+            const SizedBox(width: 12),
+            const Flexible(
+              child: Text(
+                'Models not loaded — embeddings skipped',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+                softWrap: true,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
   }
 
   await _congratulateScanEnd();
@@ -597,6 +676,21 @@ Future<IndexResult> _scanAndIndex(
     indexedFail: embedFail,
     skipped: indexedCount - embedOk - embedFail,
   );
+}
+
+Future<void> _autoInitEmbedding() async {
+  try {
+    final modelsPath = await EmbeddingService.resolveModelsPath();
+    final tier = PlayerPrefs.getString('model_tier', 'low');
+    final clipDim = EmbeddingService.clipDimForTier(tier);
+    await EmbeddingService.instance.initialize(
+      modelsPath: modelsPath,
+      tier: tier,
+      clipDim: clipDim,
+    );
+  } catch (e) {
+    debugPrint('[indexer] auto-init embedding failed: $e');
+  }
 }
 
 Future<void> _congratulateScanEnd() async {
@@ -774,14 +868,15 @@ Future<void> _createSchema(Database db, String currentPath) async {
     CREATE INDEX IF NOT EXISTS idx_tags_slug ON tags(slug);
   ''');
 
+  final currentTier = PlayerPrefs.getString('model_tier', 'low');
   await db.insert('roots', {
     'id': 1,
     'root_path': currentPath,
     'root_name': rootName,
     'created_at': now,
     'indexed_at': null,
-    'model_tier': 'low',
-    'model_name': 'clip-vit-b32',
+    'model_tier': currentTier,
+    'model_name': currentTier == 'high' ? 'clip-vit-l14' : 'clip-vit-b32',
     'app_version': null,
     'schema_version': 2,
   });
@@ -1000,7 +1095,7 @@ Future<List<String>> getAvailableTags(String rootPath) async {
   Set<String> allTags = {};
 
   // from CustomTagsStore (user-defined)
-  allTags.addAll(CustomTagsStore.instance.tags);
+  allTags.addAll(CustomTagsStore.instance.tagNames);
 
   // from DB (any custom tags that were created via addFileTag)
   if (File(dbPath).existsSync()) {
@@ -1061,7 +1156,12 @@ Future<(int, int)> _processEmbedQueue(
         debugPrint('[embed] error for ${job.absPath}: $e');
         // mark file status as 'embed_failed' so UI can show X
         try {
-          await db.update('files', {'status': 'embed_failed'}, where: 'id = ?', whereArgs: [job.fileId]);
+          await db.update(
+            'files',
+            {'status': 'embed_failed'},
+            where: 'id = ?',
+            whereArgs: [job.fileId],
+          );
         } catch (_) {}
       }
       done++;
@@ -1117,7 +1217,9 @@ Future<Float32List?> _embedTextForFile(
   if (job.mediaType != 'text') return null;
   try {
     final content = await File(job.absPath).readAsString();
-    final truncated = content.length > 1000 ? content.substring(0, 1000) : content;
+    final truncated = content.length > 1000
+        ? content.substring(0, 1000)
+        : content;
     final tokenIds = tokenizer.encodeClip(truncated);
     return svc.embedClipText(tokenIds);
   } catch (e) {
@@ -1142,10 +1244,14 @@ Future<Float32List?> _embedClipForFile(
     try {
       await Process.run('ffmpeg', [
         '-y',
-        '-i', job.absPath,
-        '-vframes', '1',
-        '-s', '224x224',
-        '-f', 'image2',
+        '-i',
+        job.absPath,
+        '-vframes',
+        '1',
+        '-s',
+        '224x224',
+        '-f',
+        'image2',
         keyframePath,
       ]);
       final bytes = await File(keyframePath).readAsBytes();
@@ -1171,11 +1277,16 @@ Future<Float32List?> _embedClapForFile(
   try {
     final args = <String>[
       '-y',
-      '-i', job.absPath,
-      '-acodec', 'pcm_s16le',
-      '-ar', '48000',
-      '-ac', '1',
-      '-f', 's16le',
+      '-i',
+      job.absPath,
+      '-acodec',
+      'pcm_s16le',
+      '-ar',
+      '48000',
+      '-ac',
+      '1',
+      '-f',
+      's16le',
     ];
     if (job.mediaType == 'video') {
       args.insertAll(1, ['-vn']);
@@ -1231,6 +1342,18 @@ Future<(Float32List, String)?> _embedMetadata(
       final secs = int.tryParse(meta['duration_ms']!) ?? 0;
       parts.add('duration: ${(secs / 1000).toStringAsFixed(1)}s');
     }
+  }
+
+  // nudge: append custom tag definitions so the embedder understands user's vocabulary
+  final customTags = CustomTagsStore.instance.tags;
+  if (customTags.isNotEmpty) {
+    final tagParts = customTags.entries
+        .map((e) {
+          final desc = e.value.isNotEmpty ? ': ${e.value}' : '';
+          return '@${e.key}$desc';
+        })
+        .join(', ');
+    parts.add('tags: {$tagParts}');
   }
 
   final metadataText = parts.join(', ');

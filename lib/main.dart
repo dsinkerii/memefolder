@@ -13,6 +13,7 @@ import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/widgets/file_preview.dart';
 import 'package:memefolder/widgets/folder_view.dart';
+import 'package:memefolder/widgets/welcome_dialog.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
@@ -28,6 +29,7 @@ void main() async {
   JustAudioMediaKit.ensureInitialized();
   setNavigatorKey(navigatorKey);
   await PlayerPrefs.init();
+  PlayerPrefs.setInt('launch_count', PlayerPrefs.getInt('launch_count', 0) + 1);
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
   try {
@@ -155,6 +157,11 @@ class _MyHomePageState extends State<MyHomePage> {
     _isGrid = PlayerPrefs.getBool("is_grid", false);
     _folderScale = PlayerPrefs.getFloat("folder_scale", 1.0).clamp(0.0, 1.0);
     _navigateTo(initial);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!isWelcomeDone && mounted) {
+        showWelcomeDialog(context);
+      }
+    });
   }
 
   void _applyFilter() {

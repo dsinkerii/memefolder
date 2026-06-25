@@ -5,6 +5,9 @@
 #include <gdk/gdkx.h>
 #endif
 
+#include <limits.h>
+#include <stdlib.h>
+
 #include "flutter/generated_plugin_registrant.h"
 
 struct _MyApplication {
@@ -53,6 +56,15 @@ static void my_application_activate(GApplication* application) {
   }
 
   gtk_window_set_default_size(window, 1280, 720);
+
+  // Set window icon from bundled data dir.
+  char resolved_path[PATH_MAX];
+  if (realpath("/proc/self/exe", resolved_path)) {
+    g_autofree gchar *exe_dir = g_path_get_dirname(resolved_path);
+    g_autofree gchar *icon_path =
+        g_build_filename(exe_dir, "data", "app_icon.png", NULL);
+    gtk_window_set_icon_from_file(window, icon_path, NULL);
+  }
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(

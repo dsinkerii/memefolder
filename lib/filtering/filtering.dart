@@ -1,13 +1,14 @@
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/backend/embedding_service.dart';
 import 'package:memefolder/backend/tokenizer.dart';
+import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:path/path.dart' as p;
+import 'package:memefolder/prefs.dart';
 import 'package:sqflite/sqflite.dart';
 
 sealed class FilterExpr {}
@@ -257,14 +258,19 @@ class FilterService extends ChangeNotifier {
   void _extractScoreConstraints() {
     _minScore = null;
     _maxScore = null;
-    final scoreMatch = RegExp(r'@score([<>=]=?)(\d+(?:\.\d+)?)').firstMatch(_query);
+    final scoreMatch = RegExp(
+      r'@score([<>=]=?)(\d+(?:\.\d+)?)',
+    ).firstMatch(_query);
     if (scoreMatch == null) return;
     final op = scoreMatch.group(1)!;
     final val = double.tryParse(scoreMatch.group(2)!);
     if (val == null) return;
     if (op == '>' || op == '>=') _minScore = val;
     if (op == '<' || op == '<=') _maxScore = val;
-    if (op == '=') { _minScore = val; _maxScore = val; }
+    if (op == '=') {
+      _minScore = val;
+      _maxScore = val;
+    }
   }
 
   /// Extract plain text (non-tag) tokens for semantic search.
@@ -288,6 +294,21 @@ class FilterService extends ChangeNotifier {
     _semanticText = parts.join(' ').trim();
   }
 
+  Future<void> _autoInitEmbedding() async {
+    try {
+      final modelsPath = await EmbeddingService.resolveModelsPath();
+      final tier = PlayerPrefs.getString('model_tier', 'low');
+      final clipDim = EmbeddingService.clipDimForTier(tier);
+      await EmbeddingService.instance.initialize(
+        modelsPath: modelsPath,
+        tier: tier,
+        clipDim: clipDim,
+      );
+    } catch (e) {
+      debugPrint('[filter] auto-init embedding failed: $e');
+    }
+  }
+
   Future<List<String>> execute(String rootPath) async {
     Set<String> tagPaths = {};
     List<String> semanticPaths = [];
@@ -296,8 +317,35 @@ class FilterService extends ChangeNotifier {
       tagPaths = await executeFilter(rootPath, _expression!);
     }
 
-    if (_semanticText.isNotEmpty && EmbeddingService.instance.isInitialized) {
-      semanticPaths = await _executeSemantic(rootPath);
+    if (_semanticText.isNotEmpty) {
+      if (!EmbeddingService.instance.isInitialized) {
+        await _autoInitEmbedding();
+      }
+      if (EmbeddingService.instance.isInitialized) {
+        semanticPaths = await _executeSemantic(rootPath);
+      } else {
+        showBubble(
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off, color: Color(0xFFFF6B6B)),
+              const SizedBox(width: 12),
+              const Flexible(
+                child: Text(
+                  'No embedding models loaded — download first',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    decoration: TextDecoration.none,
+                  ),
+                  softWrap: true,
+                ),
+              ),
+            ],
+          ),
+        );
+      }
     }
 
     // Apply @score> / @score< constraints
@@ -356,9 +404,48 @@ class FilterService extends ChangeNotifier {
     final db = await openDatabase(dbPath, readOnly: true);
 
     try {
+      // warn if DB tier != current model tier
+      try {
+        final rows = await db.rawQuery(
+          'SELECT model_tier FROM roots WHERE id = 1',
+        );
+        if (rows.isNotEmpty) {
+          final dbTier = rows.first['model_tier'] as String? ?? 'low';
+          final currentTier = PlayerPrefs.getString('model_tier', 'low');
+          if (dbTier != currentTier) {
+            showBubble(
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.warning_amber_rounded),
+                  const SizedBox(width: 12),
+                  Flexible(
+                    child: Text(
+                      'Embeddings built with "$dbTier" model, current is "$currentTier" -- re-index for best results',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        decoration: TextDecoration.none,
+                      ),
+                      softWrap: true,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+        }
+      } catch (_) {
+        // old schema without model_tier column — ignore
+      }
       final mediaWhere = <String>[];
-      if (_clipMode) { mediaWhere.addAll(['image', 'video']); }
-      if (_clapMode) { mediaWhere.addAll(['audio', 'video']); }
+      if (_clipMode) {
+        mediaWhere.addAll(['image', 'video']);
+      }
+      if (_clapMode) {
+        mediaWhere.addAll(['audio', 'video']);
+      }
       final mediaList = mediaWhere.toSet().toList();
       final placeholders = mediaList.map((_) => '?').join(',');
       final rows = await db.rawQuery('''
@@ -385,17 +472,19 @@ class FilterService extends ChangeNotifier {
           final blob = row['clip_emb'] as Uint8List;
           if (blob.length == cd4) {
             final fileEmb = Float32List.view(blob.buffer, 0, cd);
-            clipScore = _cosineSimilarity(queryClip!, fileEmb);
-            if (clipScore! > bestScore) bestScore = clipScore!;
+            clipScore = _cosineSimilarity(queryClip, fileEmb);
+            if (clipScore > bestScore) bestScore = clipScore;
           }
         }
 
-        if (clipScore == null && queryClip != null && row['metadata_emb'] is Uint8List) {
+        if (clipScore == null &&
+            queryClip != null &&
+            row['metadata_emb'] is Uint8List) {
           final blob = row['metadata_emb'] as Uint8List;
           if (blob.length == cd4) {
             final fileEmb = Float32List.view(blob.buffer, 0, cd);
-            clipScore = _cosineSimilarity(queryClip!, fileEmb);
-            if (clipScore! > bestScore) bestScore = clipScore!;
+            clipScore = _cosineSimilarity(queryClip, fileEmb);
+            if (clipScore > bestScore) bestScore = clipScore;
           }
         }
 
@@ -403,8 +492,8 @@ class FilterService extends ChangeNotifier {
           final blob = row['clap_emb'] as Uint8List;
           if (blob.length == ad4) {
             final fileEmb = Float32List.view(blob.buffer, 0, ad);
-            clapScore = _cosineSimilarity(queryClap!, fileEmb);
-            if (clapScore! > bestScore) bestScore = clapScore!;
+            clapScore = _cosineSimilarity(queryClap, fileEmb);
+            if (clapScore > bestScore) bestScore = clapScore;
           }
         }
 
@@ -422,7 +511,9 @@ class FilterService extends ChangeNotifier {
     if (_scores.isEmpty) return [];
 
     void normalizeMap(Map<String, double?> map) {
-      final keys = map.keys.where((k) => map[k] != null && _scores[k]! >= 0).toList();
+      final keys = map.keys
+          .where((k) => map[k] != null && _scores[k]! >= 0)
+          .toList();
       if (keys.length > 1) {
         double minV = map[keys[0]]!, maxV = map[keys[0]]!;
         for (final k in keys) {

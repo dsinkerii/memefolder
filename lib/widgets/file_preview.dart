@@ -19,11 +19,17 @@ import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:open_dir/open_dir.dart';
 import 'package:open_file/open_file.dart';
 import 'package:silky_scroll/silky_scroll.dart';
+import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
+const _appVersion = '1.0.0';
+
+// ignore: must_be_immutable
 class FilePreviewPane extends StatelessWidget {
-  const FilePreviewPane({super.key, required this.file});
+  FilePreviewPane({super.key, required this.file});
 
   final File? file;
+  bool showInfoBubble = true;
 
   @override
   Widget build(BuildContext context) {
@@ -51,56 +57,266 @@ class FilePreviewPane extends StatelessWidget {
           maxLines: 1,
         ),
       ),
-      body: SilkyScroll(
-        builder: (context, controller, physics, pointerDeviceKind) =>
-            SingleChildScrollView(
-              controller: controller,
-              child: Center(
-                child: Container(
-                  margin: const EdgeInsets.all(16),
-                  padding: .all(16),
-                  constraints: const BoxConstraints(maxWidth: 900),
-                  decoration: BoxDecoration(
-                    color: cs.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: cs.outlineVariant.withAlpha(160),
-                      width: 1.8,
-                    ),
-                  ),
-                  clipBehavior: Clip.antiAlias,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
-                        child: AspectRatio(
-                          aspectRatio: 16 / 10,
-                          child: currentFile == null
-                              ? Icon(
-                                  Icons.insert_drive_file,
-                                  size: 64,
-                                  color: cs.onSurfaceVariant,
-                                )
-                              : _PreviewContent(file: currentFile),
+      body: Stack(
+        children: [
+          SilkyScroll(
+            builder: (context, controller, physics, pointerDeviceKind) =>
+                SingleChildScrollView(
+                  controller: controller,
+                  child: Center(
+                    child: Container(
+                      margin: const EdgeInsets.all(16),
+                      padding: .all(16),
+                      constraints: const BoxConstraints(maxWidth: 900),
+                      decoration: BoxDecoration(
+                        color: cs.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: cs.outlineVariant.withAlpha(160),
+                          width: 1.8,
                         ),
                       ),
-                      if (currentFile != null) ...[
-                        const SizedBox(height: 12),
-                        _FileActionButtons(file: currentFile),
-                        const SizedBox(height: 12),
-                        _FileMetadataSection(file: currentFile),
-                        const SizedBox(height: 12),
-                        _TagsSection(file: currentFile),
-                        const SizedBox(height: 12),
-                        _AudioMetadataSection(file: currentFile),
-                      ],
-                    ],
+                      clipBehavior: Clip.antiAlias,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: AspectRatio(
+                              aspectRatio: 16 / 10,
+                              child: currentFile == null
+                                  ? Icon(
+                                      Icons.insert_drive_file,
+                                      size: 64,
+                                      color: cs.onSurfaceVariant,
+                                    )
+                                  : _PreviewContent(file: currentFile),
+                            ),
+                          ),
+                          if (currentFile != null) ...[
+                            const SizedBox(height: 12),
+                            _FileActionButtons(file: currentFile),
+                            const SizedBox(height: 12),
+                            _FileMetadataSection(file: currentFile),
+                            const SizedBox(height: 12),
+                            _TagsSection(file: currentFile),
+                            const SizedBox(height: 12),
+                            _AudioMetadataSection(file: currentFile),
+                          ],
+                        ],
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
+          ),
+          Align(alignment: .bottomCenter, child: _InfoBubble()),
+        ],
       ),
     );
+  }
+}
+
+class _InfoBubble extends StatefulWidget {
+  const _InfoBubble();
+  @override
+  State<_InfoBubble> createState() => _InfoBubbleState();
+}
+
+class _InfoBubbleState extends State<_InfoBubble>
+    with SingleTickerProviderStateMixin {
+  bool isVisible = false;
+  late final AnimationController _controller = AnimationController(
+    duration: const Duration(milliseconds: 500),
+    vsync: this,
+  );
+  late final Animation<double> _animation = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOutExpo,
+  );
+  String title = "Title";
+  String subtitle = "Subtitle";
+  IconData icon = Icons.abc;
+  String url = "https://github.com/dsinkerii/memefolder";
+  late Function? onPress;
+  late Function? onDismiss;
+
+  void _openLink(String url) async {
+    final Uri _url = Uri.parse(url);
+
+    if (!await launchUrl(_url)) {
+      throw Exception('Could not launch $_url');
+    }
+  }
+
+  bool checkForUpdates() {
+    if (PlayerPrefs.getInt('launch_count', 0) > 20 &&
+        !PlayerPrefs.getBool('was_dono_dismissed', false)) {
+      title = "Keep me online";
+      subtitle =
+          "i love making apps, but without any income, "
+          "i won't be able to make any at all :-(";
+      icon = Feather.heart;
+      onPress = () {
+        _openLink("https://boosty.to/dsinkerii");
+        PlayerPrefs.setBool('was_dono_dismissed', true);
+      };
+      onDismiss = () {
+        PlayerPrefs.setBool('was_dono_dismissed', true);
+      };
+      return true;
+    }
+    return false;
+  }
+
+  Future<bool> checkGitHubVersion() async {
+    final lastCheck = PlayerPrefs.getString('github_last_release', "1.0.0");
+
+    try {
+      final res = await http.get(
+        Uri.parse(
+          'https://api.github.com/repos/dsinkerii/memefolder/releases/latest',
+        ),
+      );
+      if (res.statusCode != 200) return false;
+
+      final data = json.decode(res.body) as Map<String, dynamic>;
+      final tag = data['tag_name'] as String?;
+      if (tag == null) return false;
+      final latest = tag.replaceFirst(RegExp(r'^v'), '');
+
+      if (_isNewer(latest, _appVersion) && mounted) {
+        setState(() {
+          isVisible = true;
+          title = 'Update: v$latest';
+          subtitle = 'you\'re on $_appVersion - grab v$latest on GitHub!';
+          icon = Icons.system_update;
+          onPress = () {
+            _openLink(
+              'https://github.com/dsinkerii/memefolder/releases/latest',
+            );
+            PlayerPrefs.setString('github_last_release', lastCheck);
+          };
+          onDismiss = () {
+            PlayerPrefs.setString('github_last_release', lastCheck);
+          };
+        });
+        isVisible = true;
+        _controller.animateTo(1);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  bool _isNewer(String a, String b) {
+    final ap = a.split('.').map((s) => int.tryParse(s) ?? 0).toList();
+    final bp = b.split('.').map((s) => int.tryParse(s) ?? 0).toList();
+    for (var i = 0; i < 3; i++) {
+      final av = i < ap.length ? ap[i] : 0;
+      final bv = i < bp.length ? bp[i] : 0;
+      if (av > bv) return true;
+      if (av < bv) return false;
+    }
+    return false;
+  }
+
+  @override
+  void initState() {
+    isVisible = checkForUpdates();
+    if (isVisible) {
+      _controller.animateTo(1);
+    }
+    checkGitHubVersion();
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return isVisible
+        ? ScaleTransition(
+            scale: _animation,
+            child: Container(
+              margin: .all(24),
+              constraints: BoxConstraints(minHeight: 64, maxWidth: 320),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerHigh,
+                border: Border.all(
+                  width: 1.5,
+                  color: cs.onSurface.withAlpha(160),
+                ),
+                borderRadius: .circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black38,
+                    spreadRadius: 5,
+                    blurRadius: 7,
+                  ),
+                ],
+              ),
+              padding: .all(12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () async {
+                        await _controller.reverse();
+                        isVisible = false;
+                        if (onPress != null) onPress!();
+                      },
+                      child: Column(
+                        mainAxisSize: .min,
+                        crossAxisAlignment: .start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(icon, color: cs.onSurface),
+                              SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  title,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontFamily: "Syne",
+                                    fontVariations: [
+                                      FontVariation('wdth', 2800),
+                                      FontVariation('wght', 600),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          SizedBox(height: 6),
+                          Text(
+                            subtitle,
+                            softWrap: true,
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () async {
+                      await _controller.reverse();
+                      isVisible = false;
+                      if (onDismiss != null) onDismiss!();
+                    },
+                    icon: Icon(Icons.close, color: cs.onSurface),
+                  ),
+                ],
+              ),
+            ),
+          )
+        : SizedBox.shrink();
   }
 }
 
@@ -139,6 +355,31 @@ class _FileActionButtons extends StatelessWidget {
     }
   }
 
+  Future<void> _copyFile(BuildContext context) async {
+    try {
+      final content = await file.readAsBytes();
+      await Clipboard.setData(
+        ClipboardData(text: String.fromCharCodes(content)),
+      );
+      if (context.mounted) {
+        showBubble(
+          Text(
+            'file copied to clipboard',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('[file_preview] copy file failed: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
@@ -168,6 +409,15 @@ class _FileActionButtons extends StatelessWidget {
             icon: Icons.copy,
             label: 'Copy Path',
             onTap: () => _copyPath(context),
+            color: cs.primary,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: _ActionButton(
+            icon: Icons.content_copy,
+            label: 'Copy File',
+            onTap: () => _copyFile(context),
             color: cs.primary,
           ),
         ),

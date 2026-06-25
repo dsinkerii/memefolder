@@ -1,5 +1,5 @@
 name: memefolder
-description: "A new Flutter project."
+description: "lets you find that *one* specific meme by the context/tags of it."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 1the .0.0
 
 environment:
   sdk: ^3.11.4
@@ -57,6 +57,12 @@ dependencies:
   path_provider: ^2.1.6
   ffi: ^2.2.0
   http: ^1.2.0
+  archive: ^4.0.3
+  file_picker: ^6.2.1
+  super_drag_and_drop: ^0.9.1
+  confetti: ^0.8.0
+  flutter_colorpicker: ^1.1.0
+  url_launcher: ^6.3.2
 
 
 

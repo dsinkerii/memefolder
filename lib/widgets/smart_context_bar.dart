@@ -229,7 +229,7 @@ class _ContextBarFieldState extends State<_ContextBarField> {
     }
 
     final lower = currentWord.toLowerCase();
-    final dynamicCustomTags = CustomTagsStore.instance.tags
+    final dynamicCustomTags = CustomTagsStore.instance.tagNames
         .map(
           (t) => (tag: '@$t', color: const Color(0xFF9436A6), label: 'custom'),
         )
@@ -377,21 +377,6 @@ class _ContextBarFieldState extends State<_ContextBarField> {
                     : SizedBox.shrink();
               },
             ),
-            suffixIcon: ValueListenableBuilder(
-              valueListenable: widget.controller,
-              builder: (context, value, child) {
-                return widget.controller.text.isNotEmpty
-                    ? IconButton(
-                        icon: Icon(Icons.search,
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onSurface
-                                .withAlpha(160)),
-                        onPressed: () => _applyFilter(widget.controller.text),
-                      )
-                    : SizedBox.shrink();
-              },
-            ),
           ),
           style: newInputStyle(context).copyWith(
             fontFamily: "Syne",
@@ -450,10 +435,10 @@ final _folderPathRegex = RegExp(
 );
 
 List<Token> tokenize(String text) {
-  final customTags = CustomTagsStore.instance.tags;
+  final customTags = CustomTagsStore.instance.tagNames;
 
   List<Token> tokens = [];
-final regexTokens = RegExp(
+  final regexTokens = RegExp(
     r'(\\@)' // 1. escaped @
     r'|(@has:(?:audio|speech|text))' // 2. modality
     r'|(\(|\))' // 3. brackets

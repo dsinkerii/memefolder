@@ -1,3 +1,0 @@
-[submodule "llamacppsidecar/third_party/llama.cpp"]
-	path = llamacppsidecar/third_party/llama.cpp
-	url = https://github.com/ggml-org/llama.cpp.git

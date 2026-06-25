@@ -48,3 +48,5 @@ app.*.map.json
 /searchmodels/
 .codex.md
 /llamacppsidecar/build
+linux/runner/ort_gpu_providers/libonnxruntime_providers_cuda.so
+/linux/runner/ort_gpu_providers

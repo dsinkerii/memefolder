@@ -1,0 +1,52 @@
+name: Build Windows App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Build mel_ffi native library
+        run: |
+          cmake -B c_ffi\build -S c_ffi
+          cmake --build c_ffi\build --config Release
+        shell: pwsh
+
+      - run: flutter precache --windows
+        shell: pwsh
+
+      - run: flutter build windows --release --verbose
+
+      - name: Copy mel_ffi.dll to release bundle
+        run: |
+          copy "c_ffi\build\Release\mel_ffi.dll" "build\windows\x64\runner\Release\"
+        shell: pwsh
+
+      - name: Install VC++ Redistributable and copy DLLs
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
+          Start-Process -FilePath "vc_redist.x64.exe" -Args "/install /quiet /norestart" -Wait
+          copy "C:\Windows\System32\msvcp140.dll" "build\windows\x64\runner\Release\"
+          copy "C:\Windows\System32\vcruntime140.dll" "build\windows\x64\runner\Release\"
+          copy "C:\Windows\System32\vcruntime140_1.dll" "build\windows\x64\runner\Release\"
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memefolder-windows
+          path: build/windows/x64/runner/Release/
