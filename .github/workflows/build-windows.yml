@@ -25,7 +25,7 @@ jobs:
         run: |
           Remove-Item -Recurse -Force c_ffi\build -ErrorAction SilentlyContinue
           cmake -B c_ffi\build -S c_ffi
-          cmake --build c_ffi\build --config Release
+          cmake --build c_ffi\build --config Release --target mel_ffi
         shell: pwsh
 
       - run: flutter precache --windows
