@@ -10,6 +10,9 @@ import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/utils/binary_paths.dart';
+import 'package:memefolder/widgets/file_badges.dart';
+import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
 
 class FileBrowserPane extends StatefulWidget {
@@ -107,7 +110,10 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     if (!filter.isActive) return [];
 
     final paths = await filter.execute(rootPath);
-    return paths.map((p) => File(p)).toList();
+    final scores = filter.scores;
+    final sorted = paths.toList()
+      ..sort((a, b) => (scores[b] ?? 0).compareTo(scores[a] ?? 0));
+    return sorted.map((p) => File(p)).toList();
   }
 
   @override
@@ -363,130 +369,122 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
             future: _indexedFilesFuture,
             builder: (context, indexedSnapshot) => SilkyScroll(
               builder: (context, controller, physics, pointerDeviceKind) {
-                      if (entitiesSnapshot.hasError) {
-                        return Center(
-                          child: Text("Error: ${entitiesSnapshot.error}"),
-                        );
-                      }
-                      if (!entitiesSnapshot.hasData) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
+                if (entitiesSnapshot.hasError) {
+                  return Center(
+                    child: Text("Error: ${entitiesSnapshot.error}"),
+                  );
+                }
+                if (!entitiesSnapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
 
-                      var entities =
-                          entitiesSnapshot.data!
-                              .where(
-                                (e) => !FileManager.basename(e).startsWith('.'),
-                              )
-                              .toList();
+                var entities = entitiesSnapshot.data!
+                    .where((e) => !p.basename(e.path).startsWith('.'))
+                    .toList();
 
-                      final isFiltering = FilterService.instance.isActive;
-                      if (!isFiltering) {
-                        entities.sort((a, b) {
-                          final aIsDir = FileManager.isDirectory(a);
-                          final bIsDir = FileManager.isDirectory(b);
-                          if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-                          return FileManager.basename(
-                            a,
-                          ).toLowerCase().compareTo(
-                            FileManager.basename(b).toLowerCase(),
-                          );
-                        });
-                      }
+                final isFiltering = FilterService.instance.isActive;
+                if (!isFiltering) {
+                  entities.sort((a, b) {
+                    final aIsDir = FileManager.isDirectory(a);
+                    final bIsDir = FileManager.isDirectory(b);
+                    if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
+                    return p.basename(a.path).toLowerCase().compareTo(
+                      p.basename(b.path).toLowerCase(),
+                    );
+                  });
+                }
 
-                      if (entities.isEmpty) {
-                        if (isFiltering) {
-                          final root = PlayerPrefs.getString("main_folder");
-                          final dbExists =
-                              root.isNotEmpty &&
-                              File('$root/.memefolder.db').existsSync();
-                          return Center(
-                            child: Text(
-                              dbExists
-                                  ? "no results"
-                                  : "(!) please index directory to enable search (!)",
-                            ),
-                          );
-                        }
-                        return const Center(child: Text("Empty Directory"));
-                      }
+                if (entities.isEmpty) {
+                  if (isFiltering) {
+                    final root = PlayerPrefs.getString("main_folder");
+                    final dbExists =
+                        root.isNotEmpty &&
+                        File(p.join(root, '.memefolder.db')).existsSync();
+                    return Center(
+                      child: Text(
+                        dbExists
+                            ? "no results"
+                            : "(!) please index directory to enable search (!)",
+                      ),
+                    );
+                  }
+                  return const Center(child: Text("Empty Directory"));
+                }
 
-                      final indexedStatus = indexedSnapshot.data ?? const IndexStatus();
-                      final indexedFiles = indexedStatus.indexed;
-                      final failedFiles = indexedStatus.failed;
-                      final zoom = 0.75 + (widget.folderScale * 1.25);
-                      final listColumns = 1 + (widget.folderScale * 3).round();
-                      final gridCellWidth = 88.0 * zoom;
-                      final gridCellHeight = 120.0 * zoom;
-                      final iconSize = 44.0 * zoom;
-                      final listRowHeight = 52.0 * zoom;
-                      final listIconSize = 28.0 * zoom;
-                      final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
+                final indexedStatus =
+                    indexedSnapshot.data ?? const IndexStatus();
+                final indexedFiles = indexedStatus.indexed;
+                final failedFiles = indexedStatus.failed;
+                final zoom = 0.75 + (widget.folderScale * 1.25);
+                final listColumns = 1 + (widget.folderScale * 3).round();
+                final gridCellWidth = 88.0 * zoom;
+                final gridCellHeight = 120.0 * zoom;
+                final iconSize = 44.0 * zoom;
+                final listRowHeight = 52.0 * zoom;
+                final listIconSize = 28.0 * zoom;
+                final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
 
-                      if (widget.isGrid) {
-                        return GridView.builder(
-                          padding: const EdgeInsets.all(8),
-                          controller: controller,
-                          gridDelegate:
-                              SliverGridDelegateWithMaxCrossAxisExtent(
-                                maxCrossAxisExtent: gridCellWidth,
-                                mainAxisExtent: gridCellHeight,
-                                mainAxisSpacing: 8,
-                                crossAxisSpacing: 8,
-                              ),
-                          itemCount: entities.length,
-                          itemBuilder: (context, index) {
-                            final e = entities[index];
-                            final isDir = FileManager.isDirectory(e);
-                            return _buildGridTile(
-                              context: context,
-                              isDir: isDir,
-                              entity: e,
-                              isHovered: _hoveredPath == e.path,
-                              isSelected: _selectedPath == e.path,
-                              isIndexed:
-                                  !isDir &&
-                                  (isFiltering ||
-                                      indexedFiles.contains(e.path)),
-                              isFailed: failedFiles.contains(e.path),
-                              iconSize: iconSize,
-                              gridWidth: gridCellWidth,
-                              labelSize: labelSize,
-                            );
-                          },
-                        );
-                      } else {
-                        return GridView.builder(
-                          gridDelegate:
-                              SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: listColumns,
-                                mainAxisExtent: listRowHeight,
-                              ),
-                          controller: controller,
-                          itemCount: entities.length,
-                          itemBuilder: (context, index) {
-                            final e = entities[index];
-                            final isDir = FileManager.isDirectory(e);
-                            return _buildListTile(
-                              context: context,
-                              isDir: isDir,
-                              entity: e,
-                              isHovered: _hoveredPath == e.path,
-                              isSelected: _selectedPath == e.path,
-                              isIndexed:
-                                  !isDir &&
-                                  (isFiltering ||
-                                      indexedFiles.contains(e.path)),
-                              isFailed: failedFiles.contains(e.path),
-                              iconSize: listIconSize,
-                            );
-                          },
-                        );
-                      }
+                if (widget.isGrid) {
+                  return GridView.builder(
+                    padding: const EdgeInsets.all(8),
+                    controller: controller,
+                    gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                      maxCrossAxisExtent: gridCellWidth,
+                      mainAxisExtent: gridCellHeight,
+                      mainAxisSpacing: 8,
+                      crossAxisSpacing: 8,
+                    ),
+                    itemCount: entities.length,
+                    itemBuilder: (context, index) {
+                      final e = entities[index];
+                      final isDir = FileManager.isDirectory(e);
+                      return _buildGridTile(
+                        context: context,
+                        isDir: isDir,
+                        entity: e,
+                        isHovered: _hoveredPath == e.path,
+                        isSelected: _selectedPath == e.path,
+                        isIndexed:
+                            !isDir &&
+                            (isFiltering || indexedFiles.contains(e.path)),
+                        isFailed: failedFiles.contains(e.path),
+                        iconSize: iconSize,
+                        gridWidth: gridCellWidth,
+                        labelSize: labelSize,
+                      );
                     },
-                  ),
+                  );
+                } else {
+                  return GridView.builder(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: listColumns,
+                      mainAxisExtent: listRowHeight,
+                    ),
+                    controller: controller,
+                    itemCount: entities.length,
+                    itemBuilder: (context, index) {
+                      final e = entities[index];
+                      final isDir = FileManager.isDirectory(e);
+                      return _buildListTile(
+                        context: context,
+                        isDir: isDir,
+                        entity: e,
+                        isHovered: _hoveredPath == e.path,
+                        isSelected: _selectedPath == e.path,
+                        isIndexed:
+                            !isDir &&
+                            (isFiltering || indexedFiles.contains(e.path)),
+                        isFailed: failedFiles.contains(e.path),
+                        iconSize: listIconSize,
+                      );
+                    },
+                  );
+                }
+              },
             ),
           ),
         ),
+      ),
       floatingActionButton: Tooltip(
         message: 'Re-index current folder',
         child: IconButton(
@@ -509,10 +507,10 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     cancelToken: _cancelToken,
                   );
                   setState(() {
-                    _indexedFilesFuture = getIndexedFiles(
+                    _indexedFilesFuture = getIndexedFiles(widget.currentPath);
+                    _entitiesFuture = Directory(
                       widget.currentPath,
-                    );
-                    _entitiesFuture = Directory(widget.currentPath).list().toList();
+                    ).list().toList();
                   });
                   indexProgress.value = 0;
                   isReindexing.value = false;
@@ -629,7 +627,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                   const SizedBox(height: 4),
                   Expanded(
                     child: Text(
-                      FileManager.basename(entity),
+                      p.basename(entity.path),
                       maxLines: 3,
                       overflow: TextOverflow.ellipsis,
                       textAlign: TextAlign.center,
@@ -680,7 +678,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 isFailed: isFailed,
               ),
               title: Text(
-                FileManager.basename(entity),
+                p.basename(entity.path),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
@@ -701,7 +699,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required double iconSize,
   }) {
     final fs = FilterService.instance;
-    final score = fs.scores[entity.path];
+    //final score = fs.scores[entity.path];
     final clipScore = fs.clipScores[entity.path];
     final clapScore = fs.clapScores[entity.path];
 
@@ -750,7 +748,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
 
     final badges = <Widget>[];
     if (isFailed) badges.add(const _FailedBadge());
-    if (isIndexed && !isFailed) badges.add(const _IndexedBadge());
+    if (isIndexed && !isFailed) badges.add(const IndexedBadge());
     if (clipScore != null || clapScore != null) {
       badges.add(_DualScoreBadge(clip: clipScore, clap: clapScore));
     }
@@ -782,7 +780,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     if (await thumb.exists()) return thumb;
 
     try {
-      final result = await Process.run('ffmpeg', [
+      final result = await Process.run(ffmpegPath, [
         '-y',
         '-ss',
         '00:00:01',
@@ -963,28 +961,6 @@ class _PreviewBadge extends StatelessWidget {
   }
 }
 
-class _IndexedBadge extends StatelessWidget {
-  const _IndexedBadge();
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      bottom: 2,
-      right: 2,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.primary,
-          shape: BoxShape.circle,
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(2),
-          child: Icon(Icons.check, color: Colors.white, size: 10),
-        ),
-      ),
-    );
-  }
-}
-
 class _FailedBadge extends StatelessWidget {
   const _FailedBadge();
 
@@ -1012,29 +988,24 @@ class _DualScoreBadge extends StatelessWidget {
   final double? clap;
   const _DualScoreBadge({this.clip, this.clap});
 
-  static Color _bg(double score) {
-    final pct = score.round();
-    if (pct >= 80) return Colors.green.shade700;
-    if (pct >= 65) return Colors.orange.shade700;
-    return Colors.red.shade700;
+  Color _scoreColor(ColorScheme cs, double score) {
+    if (score < 50) return cs.error;
+    final t = (score - 50) / 50;
+    return Color.lerp(cs.error, cs.primary, t)!;
   }
 
   @override
   Widget build(BuildContext context) {
-    final chips = <Widget>[];
-    if (clip != null) {
-      chips.add(_Chip(label: 'C${clip!.round()}', color: _bg(clip!)));
-    }
-    if (clap != null) {
-      chips.add(_Chip(label: 'A${clap!.round()}', color: _bg(clap!)));
-    }
-    if (chips.isEmpty) return const SizedBox.shrink();
+    final cs = Theme.of(context).colorScheme;
+    final scores = [?clip, ?clap].whereType<double>().toList();
+    if (scores.isEmpty) return const SizedBox.shrink();
+    final best = scores.reduce((a, b) => a > b ? a : b);
     return Positioned(
       top: 2,
       left: 2,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: chips,
+      child: _Chip(
+        label: '${best.round()}%',
+        color: _scoreColor(cs, best),
       ),
     );
   }

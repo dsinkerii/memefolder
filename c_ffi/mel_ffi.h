@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+#ifdef _WIN32
+  #define MEL_FFI_EXPORT __declspec(dllexport)
+#else
+  #define MEL_FFI_EXPORT
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,6 +34,12 @@ extern "C" {
 #define CLIP_STD_B         0.27577711f
 
 /*
+ * Initialize mel_ffi: install crash handlers.
+ * Must be called once before any other function.
+ */
+MEL_FFI_EXPORT void mel_init(void);
+
+/*
  * Compute CLAP log-mel spectrogram from raw PCM audio.
  *
  * pcm: 48kHz mono PCM samples (float32, range [-1, 1])
@@ -37,7 +49,7 @@ extern "C" {
  *
  * Handles truncation to 10s and padding internally.
  */
-void compute_clap_mel(const float* pcm, int num_samples, float* output);
+MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* output);
 
 /*
  * Preprocess image for CLIP vision encoder.
@@ -49,7 +61,7 @@ void compute_clap_mel(const float* pcm, int num_samples, float* output);
  *
  * Returns 0 on success, -1 on error.
  */
-int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output);
+MEL_FFI_EXPORT int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output);
 
 #ifdef __cplusplus
 }

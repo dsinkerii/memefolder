@@ -16,9 +16,10 @@ class PlayerPrefs {
     try {
       await storage.deleteAll();
     } catch (e) {
-      /* woops! */
+      debugPrint('[prefs] secure storage deleteAll failed: $e');
     }
     await _prefs.clear();
+    _cache.clear();
   }
 
   static Future<void> reload() async {

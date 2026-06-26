@@ -48,3 +48,9 @@ app.*.map.json
 /searchmodels/
 .codex.md
 /llamacppsidecar/build
+
+# c ffi build output
+c_ffi/build/
+
+# onnxruntime gpu providers (build artifacts)
+**/ort_gpu_providers/

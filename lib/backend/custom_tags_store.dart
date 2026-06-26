@@ -7,20 +7,21 @@ class CustomTagsStore extends ChangeNotifier {
   static final instance = CustomTagsStore._();
   CustomTagsStore._();
 
-  Set<String> _tags = {};
+  Map<String, String> _tags = {};
 
-  Set<String> get tags => _tags;
+  Set<String> get tagNames => _tags.keys.toSet();
+  Map<String, String> get tags => _tags;
 
   void load() {
     final raw = PlayerPrefs.getString("custom_tags", '{}');
     if (raw.isNotEmpty) {
       try {
-        _tags = Map<String, String>.from(jsonDecode(raw)).keys.toSet();
+        _tags = Map<String, String>.from(jsonDecode(raw));
       } catch (_) {
-        _tags = {'dsinkerii'};
+        _tags = {'dsinkerii': 'awesome developer'};
       }
     } else {
-      _tags = {'dsinkerii'};
+      _tags = {'dsinkerii': 'awesome developer'};
     }
     notifyListeners();
   }

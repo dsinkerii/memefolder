@@ -1,0 +1,71 @@
+name: Build Windows App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Build mel_ffi native library
+        run: |
+          Remove-Item -Recurse -Force c_ffi\build -ErrorAction SilentlyContinue
+          cmake -B c_ffi\build -S c_ffi
+          cmake --build c_ffi\build --config Release --target mel_ffi
+        shell: pwsh
+
+      - run: flutter build windows --release
+
+      - name: Copy native DLLs to release bundle
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          copy "c_ffi\build\Release\mel_ffi.dll" "$rel\"
+          copy "windows\flutter\ephemeral\.plugin_symlinks\onnxruntime_v2\windows\onnxruntime.dll" "$rel\"
+        shell: pwsh
+
+      - name: Bundle ffmpeg for thumbnail and audio extraction
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "$env:TEMP\ffmpeg.zip" -MaximumRetryCount 5 -TimeoutSec 120
+          Expand-Archive -Path "$env:TEMP\ffmpeg.zip" -DestinationPath "$env:TEMP\ffmpeg" -Force
+          $ffmpegDir = Get-ChildItem "$env:TEMP\ffmpeg" -Directory | Select-Object -First 1 -ExpandProperty FullName
+          copy "$ffmpegDir\bin\ffmpeg.exe" "$rel\"
+          copy "$ffmpegDir\bin\ffprobe.exe" "$rel\"
+          Remove-Item -Recurse -Force "$env:TEMP\ffmpeg", "$env:TEMP\ffmpeg.zip"
+        shell: pwsh
+
+      - name: Install VC++ Redistributable and copy DLLs
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
+          Start-Process -FilePath "vc_redist.x64.exe" -Args "/install /quiet /norestart" -Wait
+          # onnxruntime.dll links these vc++ redist dlls
+          copy "C:\Windows\System32\msvcp140.dll" "$rel\"
+          copy "C:\Windows\System32\msvcp140_1.dll" "$rel\"
+          copy "C:\Windows\System32\vcruntime140.dll" "$rel\"
+          copy "C:\Windows\System32\vcruntime140_1.dll" "$rel\"
+        shell: pwsh
+
+      - name: Verify DLLs in release bundle
+        run: |
+          Get-ChildItem "build\windows\x64\runner\Release\*.dll"
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memefolder-windows
+          path: build/windows/x64/runner/Release/

@@ -1,1 +1,0 @@
-/usr/bin/cc -Wl,--dependency-file=CMakeFiles/test_mel.dir/link.d CMakeFiles/test_mel.dir/test_mel.c.o -o test_mel  -Wl,-rpath,/home/dsinkerii/Documents/Projects/memefolder/memefolder/c_ffi/build libmel_ffi.so -lm

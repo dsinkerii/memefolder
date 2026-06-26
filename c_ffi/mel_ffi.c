@@ -3,9 +3,83 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <signal.h>
+  #include <unistd.h>
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+/* ================================================================
+ * Native crash handler — writes log before process dies
+ * Uses only async-signal-safe syscalls, never malloc/fopen/fprintf
+ * ================================================================ */
+#ifdef _WIN32
+  #include <windows.h>
+  /* Use high-ASCII fallback instead of wide-char for simplicity */
+  static const char CRASH_LOG_PATH[] = "C:\\memefolder_crash.txt";
+#else
+  #include <signal.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  static const char CRASH_LOG_PATH[] = "/tmp/memefolder_crash.txt";
+#endif
+
+static void write_crash_log(const char* msg) {
+    int fd;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(
+        CRASH_LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    DWORD written;
+    WriteFile(h, msg, (DWORD)strlen(msg), &written, NULL);
+    WriteFile(h, "\r\n", 2, &written, NULL);
+    CloseHandle(h);
+#else
+    fd = open(CRASH_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    write(fd, msg, strlen(msg));
+    write(fd, "\n", 1);
+    close(fd);
+#endif
+}
+
+#ifdef _WIN32
+static LONG WINAPI mel_veh_handler(EXCEPTION_POINTERS* ep) {
+    (void)ep;
+    write_crash_log("UNHANDLED EXCEPTION in process (caught by mel_ffi VEH)");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void install_crash_handler(void) {
+    AddVectoredExceptionHandler(1, mel_veh_handler);
+}
+#else
+static void sigsegv_handler(int sig, siginfo_t* info, void* ucontext) {
+    (void)sig; (void)info; (void)ucontext;
+    write_crash_log("SIGSEGV/SIGABRT/SIGBUS in mel_ffi (caught by signal handler)");
+    _exit(1);
+}
+
+static void install_crash_handler(void) {
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sa.sa_sigaction = sigsegv_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#endif
 
 /* ================================================================
  * Radix-2 FFT (decimation-in-time)
@@ -69,9 +143,20 @@ static void hann_window(float* win, int n) {
 }
 
 /* ================================================================
- * CLAP log-mel spectrogram
+ * Init: install crash handlers
  * ================================================================ */
-void compute_clap_mel(const float* pcm, int num_samples, float* output) {
+MEL_FFI_EXPORT void mel_init(void) {
+    static int installed = 0;
+    if (!installed) {
+        install_crash_handler();
+        installed = 1;
+    }
+}
+
+/* ================================================================
+ * CLAP log-mel spectrogram — internal implementation
+ * ================================================================ */
+static void compute_clap_mel_impl(const float* pcm, int num_samples, float* output) {
     float waveform[CLAP_MAX_SAMPLES + CLAP_N_FFT]; /* for center-padded */
     float window[CLAP_N_FFT];
     int i, f, t;
@@ -154,9 +239,28 @@ void compute_clap_mel(const float* pcm, int num_samples, float* output) {
 }
 
 /* ================================================================
+ * CLAP log-mel spectrogram — SEH-safe entry point
+ * On Windows, __try/__except catches any crash so the process survives.
+ * ================================================================ */
+MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* output) {
+#ifdef _WIN32
+    __try {
+        compute_clap_mel_impl(pcm, num_samples, output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        /* SEH caught a crash — zero output so caller gets silence instead of process death */
+        for (int i = 0; i < CLAP_N_FRAMES * CLAP_N_MELS; i++) {
+            output[i] = 0.0f;
+        }
+    }
+#else
+    compute_clap_mel_impl(pcm, num_samples, output);
+#endif
+}
+
+/* ================================================================
  * CLIP image preprocessing
  * ================================================================ */
-int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output) {
+MEL_FFI_EXPORT int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output) {
     int w, h, channels;
     unsigned char* img = stbi_load_from_memory(image_data, data_len, &w, &h, &channels, 3);
     if (!img) return -1;

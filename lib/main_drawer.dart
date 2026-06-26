@@ -1,24 +1,26 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_vector_icons/flutter_vector_icons.dart';
-import 'package:memefolder/config/theme.dart';
-import 'package:memefolder/prefs.dart';
+import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/widgets/custom_tags_dialog.dart';
-import 'package:memefolder/widgets/model_manager.dart';
 import 'package:memefolder/widgets/runtime_manager.dart';
-import 'package:provider/provider.dart';
+import 'package:memefolder/widgets/settings_dialog.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 Widget buildDrawer(BuildContext context) {
   return Drawer(
     child: Column(
       children: [
+        Padding(
+          padding: .all(20),
+          child: Image(image: ExactAssetImage('Assets/Images/CroppedLogo.png')),
+        ),
+        const Divider(),
         ListTile(
-          leading: Icon(Icons.remove_red_eye),
-          title: Text("toggle theme"),
+          leading: Icon(Icons.settings),
+          title: Text("settings"),
           onTap: () {
-            final toggle = !PlayerPrefs.getBool("isDarkMode", true);
-            PlayerPrefs.setBool("isDarkMode", toggle);
-
-            Provider.of<ThemeModel>(context, listen: false).dark = toggle;
+            Navigator.of(context).pop();
+            showSettingsDialog(context);
           },
         ),
         ListTile(
@@ -37,15 +39,52 @@ Widget buildDrawer(BuildContext context) {
             showRuntimeManagerDialog(context);
           },
         ),
+        Spacer(),
         ListTile(
-          leading: Icon(Icons.model_training),
-          title: Text("models"),
+          leading: Icon(Zocial.github),
+          title: Text("github page"),
           onTap: () {
             Navigator.of(context).pop();
-            showModelManagerDialog(context);
+            _openLink("https://github.com/dsinkerii/memefolder");
+          },
+        ),
+        ListTile(
+          leading: Icon(Icons.attach_money),
+          title: Text("support me"),
+          onTap: () {
+            Navigator.of(context).pop();
+
+            showBubble(
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(AntDesign.smile_circle, color: Colors.white),
+                  const SizedBox(width: 12),
+                  Text(
+                    "thank you",
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      decoration: TextDecoration.none,
+                    ),
+                    softWrap: true,
+                  ),
+                ],
+              ),
+            );
+            _openLink("https://boosty.to/dsinkerii");
           },
         ),
       ],
     ),
   );
+}
+
+void _openLink(String url) async {
+  final Uri _url = Uri.parse(url);
+
+  if (!await launchUrl(_url)) {
+    throw Exception('Could not launch $_url');
+  }
 }
