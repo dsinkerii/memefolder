@@ -20,9 +20,22 @@ import 'package:open_file/open_file.dart';
 import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
 import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 const _appVersion = '1.0.0';
+String? _cachedVersion;
+
+Future<String> _getAppVersion() async {
+  if (_cachedVersion != null) return _cachedVersion!;
+  try {
+    final info = await PackageInfo.fromPlatform();
+    _cachedVersion = info.version;
+    return _cachedVersion!;
+  } catch (_) {
+    return _appVersion;
+  }
+}
 
 // ignore: must_be_immutable
 class FilePreviewPane extends StatelessWidget {
@@ -168,7 +181,7 @@ class _InfoBubbleState extends State<_InfoBubble>
   }
 
   Future<bool> checkGitHubVersion() async {
-    final lastCheck = PlayerPrefs.getString('github_last_release', "1.0.0");
+    final appVersion = await _getAppVersion();
 
     try {
       final res = await http.get(
@@ -183,26 +196,32 @@ class _InfoBubbleState extends State<_InfoBubble>
       if (tag == null) return false;
       final latest = tag.replaceFirst(RegExp(r'^v'), '');
 
-      if (_isNewer(latest, _appVersion) && mounted) {
-        setState(() {
-          isVisible = true;
-          title = 'Update: v$latest';
-          subtitle = 'you\'re on $_appVersion - grab v$latest on GitHub!';
-          icon = Icons.system_update;
-          onPress = () {
-            _openLink(
-              'https://github.com/dsinkerii/memefolder/releases/latest',
-            );
-            PlayerPrefs.setString('github_last_release', lastCheck);
-          };
-          onDismiss = () {
-            PlayerPrefs.setString('github_last_release', lastCheck);
-          };
-        });
-        isVisible = true;
-        _controller.animateTo(1);
-        return true;
+      // Don't show if latest is not newer than current app version
+      if (!_isNewer(latest, appVersion)) return false;
+
+      // Don't show if already dismissed for this version
+      if (PlayerPrefs.getString('github_dismissed_version', '') == latest) {
+        return false;
       }
+
+      if (!mounted) return false;
+      setState(() {
+        isVisible = true;
+        title = 'Update: v$latest';
+        subtitle = 'you\'re on $appVersion - grab v$latest on GitHub!';
+        icon = Icons.system_update;
+        onPress = () {
+          _openLink(
+            'https://github.com/dsinkerii/memefolder/releases/latest',
+          );
+        };
+        onDismiss = () {
+          PlayerPrefs.setString('github_dismissed_version', latest);
+        };
+      });
+      isVisible = true;
+      _controller.animateTo(1);
+      return true;
     } catch (_) {}
     return false;
   }
