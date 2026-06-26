@@ -12,6 +12,7 @@ import 'package:memefolder/backend/audio_player_service.dart';
 import 'package:memefolder/backend/indexer.dart';
 import 'package:memefolder/backend/waveform_generator.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/utils/binary_paths.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:open_dir/open_dir.dart';
@@ -803,7 +804,7 @@ class _AudioMetadataSectionState extends State<_AudioMetadataSection> {
 
   Future<Map<String, String?>> _extract(String path) async {
     try {
-      final result = await Process.run('ffprobe', [
+      final result = await Process.run(ffprobePath, [
         '-v',
         'error',
         '-show_entries',
@@ -1341,6 +1342,7 @@ class _MediaPreviewState extends State<_MediaPreview> {
   double _volume = PlayerPrefs.getFloat('video_volume', 80);
   bool _hovering = false;
   Timer? _hideTimer;
+  bool _openFailed = false;
 
   @override
   void initState() {
@@ -1362,16 +1364,28 @@ class _MediaPreviewState extends State<_MediaPreview> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.file.path != widget.file.path ||
         oldWidget.loop != widget.loop) {
+      _openFailed = false;
       _open();
     }
   }
 
   Future<void> _open() async {
-    await _player.setPlaylistMode(
-      widget.loop ? PlaylistMode.loop : PlaylistMode.none,
-    );
-    await _player.setVolume(_volume);
-    await _player.open(Media(widget.file.path), play: false);
+    try {
+      await _player.setPlaylistMode(
+        widget.loop ? PlaylistMode.loop : PlaylistMode.none,
+      );
+      await _player.setVolume(_volume);
+      await _player.open(Media(widget.file.path), play: false);
+      // Wait briefly for the player to report media duration.
+      // If duration stays zero, the media probably can't be decoded.
+      await Future.delayed(const Duration(seconds: 1));
+      if (_player.state.duration.inMilliseconds == 0) {
+        if (mounted) setState(() => _openFailed = true);
+      }
+    } catch (e) {
+      debugPrint('[media_preview] failed to open video: $e');
+      if (mounted) setState(() => _openFailed = true);
+    }
   }
 
   @override
@@ -1404,11 +1418,26 @@ class _MediaPreviewState extends State<_MediaPreview> {
         children: [
           ColoredBox(
             color: Colors.black,
-            child: Video(
-              controller: _controller,
-              fit: BoxFit.contain,
-              controls: null,
-            ),
+            child: _openFailed
+                ? const Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.videocam_off_rounded,
+                            color: Colors.white38, size: 48),
+                        SizedBox(height: 8),
+                        Text(
+                          'video playback unavailable',
+                          style: TextStyle(color: Colors.white38),
+                        ),
+                      ],
+                    ),
+                  )
+                : Video(
+                    controller: _controller,
+                    fit: BoxFit.contain,
+                    controls: null,
+                  ),
           ),
           Positioned.fill(
             child: StreamBuilder<bool>(

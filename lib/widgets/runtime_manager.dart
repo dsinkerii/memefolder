@@ -15,7 +15,7 @@ import 'package:memefolder/backend/embedding_service.dart';
 import 'package:memefolder/backend/system_specs.dart';
 import 'package:memefolder/helpers/new_dialog.dart';
 import 'package:memefolder/prefs.dart';
-import 'package:super_drag_and_drop/super_drag_and_drop.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 
 void showRuntimeManagerDialog(BuildContext context) {
   showScaleDialog(
@@ -56,8 +56,6 @@ const tierMeta = {
 };
 
 Future<String> _modelsDir() async {
-  final projectDir = Directory(p.join(Directory.current.path, 'searchmodels'));
-  if (await projectDir.exists()) return projectDir.path;
   return p.join((await getApplicationSupportDirectory()).path, 'models');
 }
 
@@ -736,53 +734,23 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(vertical: 16),
-                child: DropRegion(
-                  formats: [Formats.zip],
-                  hitTestBehavior: HitTestBehavior.opaque,
-                  onDropOver: (event) {
-                    if (_busy) return DropOperation.none;
-
-                    final item = event.session.items.first;
-                    if (!item.canProvide(Formats.zip)) {
-                      return DropOperation.none;
-                    }
-
-                    return event.session.allowedOperations.contains(
-                          DropOperation.copy,
-                        )
-                        ? DropOperation.copy
-                        : DropOperation.none;
-                  },
-                  onDropEnter: (event) {
+                child: DropTarget(
+                  onDragEntered: (_) {
                     if (!_busy) {
                       setState(() => _dragHoveringZip = true);
                     }
                   },
-                  onDropLeave: (event) {
+                  onDragExited: (_) {
                     if (_dragHoveringZip) {
                       setState(() => _dragHoveringZip = false);
                     }
                   },
-                  onPerformDrop: (event) async {
+                  onDragDone: (details) async {
                     setState(() => _dragHoveringZip = false);
-
-                    final item = event.session.items.first;
-                    final reader = item.dataReader;
-                    if (reader == null || !reader.canProvide(Formats.zip)) {
-                      return;
-                    }
-
-                    reader.getFile(
-                      Formats.zip,
-                      (file) async {
-                        final bytes = await file.readAll();
-
-                        await _uploadZip(bytes: bytes);
-                      },
-                      onError: (error) {
-                        debugPrint('ZIP drop failed: $error');
-                      },
-                    );
+                    final f = details.files.firstOrNull;
+                    if (f == null || !f.name.endsWith('.zip')) return;
+                    final bytes = await f.readAsBytes();
+                    await _uploadZip(bytes: bytes);
                   },
                   child: Column(
                     children: [

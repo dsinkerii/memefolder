@@ -7,6 +7,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/backend/custom_tags_store.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/utils/crash_logger.dart';
+import 'package:memefolder/utils/binary_paths.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
 
@@ -65,6 +67,7 @@ Future<IndexResult> indexDirectory(
   );
 
   onProgress?.call(0);
+  stderr.writeln('[memefolder] indexDirectory: start path=$currentPath dbExists=$dbExists');
 
   try {
     final totalCount = await _countFiles(currentPath);
@@ -263,7 +266,7 @@ String _mediaTypeForExt(String? ext) {
 
 Future<Map<String, String?>> _extractAudioMetadata(String filePath) async {
   try {
-    final result = await Process.run('ffprobe', [
+    final result = await Process.run(ffprobePath, [
       '-v',
       'error',
       '-show_entries',
@@ -322,6 +325,7 @@ Future<IndexResult> _scanAndIndex(
   CancellationToken? cancelToken,
 }) async {
   final db = await openDatabase(dbPath);
+  stderr.writeln('[memefolder] _scanAndIndex: start rootPath=$rootPath totalCount=$totalCount');
 
   var indexedCount = 0;
   var embedOk = 0;
@@ -426,6 +430,7 @@ Future<IndexResult> _scanAndIndex(
 
   Future<void> scanFolder(Transaction txn, String relPath, int depth) async {
     if (depth > 5) return; // cap at depth 5
+    stderr.writeln('[memefolder] scanFolder: depth=$depth path=$relPath');
     await _player.setAsset('Assets/SFX/done.mp3');
     _player.load();
     await _warnplayer.setAsset('Assets/SFX/warning.mp3');
@@ -439,38 +444,39 @@ Future<IndexResult> _scanAndIndex(
 
     final entries = dir.listSync(followLinks: false);
     for (final entity in entries) {
-      if (cancelToken?.isCancelled ?? false) return;
-      final name = p.basename(entity.path);
-      if (name == '.memefolder.db' ||
-          name.startsWith('.memefolder.db') ||
-          name == '.memefolder.db.tmp') {
-        continue;
-      }
-      if (entity is Directory) {
-        final subRel = relPath.isEmpty
-            ? name
-            : p.join(relPath, name).replaceAll('\\', '/');
-        await scanFolder(txn, subRel, depth + 1);
-        await txn.rawUpdate(
-          'UPDATE folders SET folder_count = folder_count + 1 WHERE id = ?',
-          [folderId],
-        );
-      } else if (entity is File) {
-        final fileRel = relPath.isEmpty
-            ? name
-            : p.join(relPath, name).replaceAll('\\', '/');
-
-        final stat = entity.statSync();
-        final ext = p.extension(name).toLowerCase().replaceFirst('.', '');
-        final stem = p.basenameWithoutExtension(name);
-        final mediaType = _mediaTypeForExt(ext);
-        // Only index images, videos, and audio. No text/docs/models/apps.
-        if (mediaType == 'unknown' || mediaType == 'text') continue;
-
-        Map<String, String?> audioMeta = {};
-        if (mediaType == 'audio') {
-          audioMeta = await _extractAudioMetadata(entity.path);
+      try {
+        if (cancelToken?.isCancelled ?? false) return;
+        final name = p.basename(entity.path);
+        if (name == '.memefolder.db' ||
+            name.startsWith('.memefolder.db') ||
+            name == '.memefolder.db.tmp') {
+          continue;
         }
+        if (entity is Directory) {
+          final subRel = relPath.isEmpty
+              ? name
+              : p.join(relPath, name).replaceAll('\\', '/');
+          await scanFolder(txn, subRel, depth + 1);
+          await txn.rawUpdate(
+            'UPDATE folders SET folder_count = folder_count + 1 WHERE id = ?',
+            [folderId],
+          );
+        } else if (entity is File) {
+          final fileRel = relPath.isEmpty
+              ? name
+              : p.join(relPath, name).replaceAll('\\', '/');
+
+          final stat = entity.statSync();
+          final ext = p.extension(name).toLowerCase().replaceFirst('.', '');
+          final stem = p.basenameWithoutExtension(name);
+          final mediaType = _mediaTypeForExt(ext);
+          // Only index images, videos, and audio. No text/docs/models/apps.
+          if (mediaType == 'unknown' || mediaType == 'text') continue;
+
+          Map<String, String?> audioMeta = {};
+          if (mediaType == 'audio') {
+            audioMeta = await _extractAudioMetadata(entity.path);
+          }
 
         final fileId = await txn.insert('files', {
           'folder_id': folderId,
@@ -567,7 +573,8 @@ Future<IndexResult> _scanAndIndex(
             fileName: stem,
           ),
         );
-      }
+        }
+      } catch (_) {}
     }
   }
 
@@ -1137,8 +1144,9 @@ Future<(int, int)> _processEmbedQueue(
   CancellationToken? cancelToken,
 ) async {
   final svc = EmbeddingService.instance;
+  stderr.writeln('[memefolder] _processEmbedQueue: queueSize=${queue.length}');
   final tokenizer = HuggingFaceTokenizer.fromFile(
-    '${svc.modelsPath}/clip/tokenizer.json',
+    p.join(svc.modelsPath!, 'clip', 'tokenizer.json'),
   );
   final db = await openDatabase(dbPath);
   var done = 0;
@@ -1148,6 +1156,7 @@ Future<(int, int)> _processEmbedQueue(
   try {
     for (final job in queue) {
       if (cancelToken?.isCancelled ?? false) break;
+      stderr.writeln('[memefolder] embedJob: fileId=${job.fileId} type=${job.mediaType} path=${job.absPath}');
       try {
         await _embedOneFile(db, svc, tokenizer, job);
         ok++;
@@ -1182,26 +1191,64 @@ Future<void> _embedOneFile(
   _EmbedJob job,
 ) async {
   final updates = <String, Object?>{};
-  final clipEmb = await _embedClipForFile(svc, tokenizer, job);
-  if (clipEmb != null && clipEmb.length == svc.clipDim) {
-    updates['clip_emb'] = clipEmb.buffer.asUint8List();
+  final crashLog = CrashLogger.instance;
+  final safeMode = PlayerPrefs.getBool('safe_mode', true);
+  final skipClap = PlayerPrefs.getBool('skip_clap', safeMode);
+  final skipVideo = PlayerPrefs.getBool('skip_video', safeMode);
+
+  crashLog.mark('embedOneFile:start', {
+    'absPath': job.absPath,
+    'safeMode': safeMode,
+    'skipClap': skipClap,
+    'skipVideo': skipVideo,
+  });
+
+  try {
+    if (skipVideo && job.mediaType == 'video') {
+      stderr.writeln('[memefolder] skip clip embedding for video (safe mode)');
+    } else {
+      final clipEmb = await _embedClipForFile(svc, tokenizer, job);
+      if (clipEmb != null && clipEmb.length == svc.clipDim) {
+        updates['clip_emb'] = clipEmb.buffer.asUint8List();
+      }
+    }
+  } catch (e) {
+    debugPrint('[embed] clip embedding failed for ${job.absPath}: $e');
   }
 
-  final clapEmb = await _embedClapForFile(svc, job);
-  if (clapEmb != null && clapEmb.length == svc.clapDim) {
-    updates['clap_emb'] = clapEmb.buffer.asUint8List();
+  try {
+    if (skipClap && (job.mediaType == 'audio' || job.mediaType == 'video')) {
+      stderr.writeln('[memefolder] skip clap embedding for ${job.mediaType} (safe mode)');
+    } else {
+      final clapEmb = await _embedClapForFile(svc, job);
+      if (clapEmb != null && clapEmb.length == svc.clapDim) {
+        updates['clap_emb'] = clapEmb.buffer.asUint8List();
+      }
+    }
+  } catch (e) {
+    debugPrint('[embed] clap embedding failed for ${job.absPath}: $e');
   }
 
-  final textEmb = await _embedTextForFile(svc, tokenizer, job);
-  if (textEmb != null && textEmb.length == svc.clipDim) {
-    updates['clip_emb'] = textEmb.buffer.asUint8List();
+  try {
+    final textEmb = await _embedTextForFile(svc, tokenizer, job);
+    if (textEmb != null && textEmb.length == svc.clipDim) {
+      updates['clip_emb'] = textEmb.buffer.asUint8List();
+    }
+  } catch (e) {
+    debugPrint('[embed] text embedding failed for ${job.absPath}: $e');
   }
 
-  final metadataResult = await _embedMetadata(svc, tokenizer, job);
-  if (metadataResult != null && metadataResult.$1.length == svc.clipDim) {
-    updates['metadata_emb'] = metadataResult.$1.buffer.asUint8List();
-    updates['metadata_text'] = metadataResult.$2;
+  try {
+    final metadataResult = await _embedMetadata(svc, tokenizer, job);
+    if (metadataResult != null && metadataResult.$1.length == svc.clipDim) {
+      updates['metadata_emb'] = metadataResult.$1.buffer.asUint8List();
+      updates['metadata_text'] = metadataResult.$2;
+    }
+  } catch (e) {
+    debugPrint('[embed] metadata embedding failed for ${job.absPath}: $e');
   }
+
+  crashLog.mark('embedOneFile:save', {'updateKeys': updates.keys.join(',')});
 
   if (updates.isNotEmpty) {
     await db.update('files', updates, where: 'id = ?', whereArgs: [job.fileId]);
@@ -1242,7 +1289,8 @@ Future<Float32List?> _embedClipForFile(
     // Extract keyframe via ffmpeg
     final keyframePath = '${job.absPath}.keyframe.jpg';
     try {
-      await Process.run('ffmpeg', [
+      stderr.writeln('[memefolder] ffmpeg keyframe: start path=${job.absPath}');
+      final result = await Process.run(ffmpegPath, [
         '-y',
         '-i',
         job.absPath,
@@ -1254,7 +1302,15 @@ Future<Float32List?> _embedClipForFile(
         'image2',
         keyframePath,
       ]);
-      final bytes = await File(keyframePath).readAsBytes();
+      stderr.writeln('[memefolder] ffmpeg keyframe: exitCode=${result.exitCode} stderr=${result.stderr}');
+      if (result.exitCode != 0) return null;
+      final keyframe = File(keyframePath);
+      if (!await keyframe.exists() || await keyframe.length() == 0) {
+        stderr.writeln('[memefolder] ffmpeg keyframe: file missing or empty');
+        return null;
+      }
+      final bytes = await keyframe.readAsBytes();
+      stderr.writeln('[memefolder] ffmpeg keyframe: size=${bytes.length} calling embedImage');
       final emb = await svc.embedImage(bytes);
       return emb;
     } finally {
@@ -1275,6 +1331,7 @@ Future<Float32List?> _embedClapForFile(
 
   final pcmPath = '${job.absPath}.pcm';
   try {
+    stderr.writeln('[memefolder] ffmpeg pcm: start path=${job.absPath}');
     final args = <String>[
       '-y',
       '-i',
@@ -1292,10 +1349,25 @@ Future<Float32List?> _embedClapForFile(
       args.insertAll(1, ['-vn']);
     }
     args.add(pcmPath);
-    await Process.run('ffmpeg', args);
+    final result = await Process.run(ffmpegPath, args);
+    stderr.writeln('[memefolder] ffmpeg pcm: exitCode=${result.exitCode} stderr=${result.stderr}');
+    if (result.exitCode != 0) return null;
 
-    final pcmBytes = await File(pcmPath).readAsBytes();
+    final pcmFile = File(pcmPath);
+    if (!await pcmFile.exists()) {
+      stderr.writeln('[memefolder] ffmpeg pcm: file not found');
+      return null;
+    }
+    final pcmLen = await pcmFile.length();
+    // Skip if PCM is empty or exceeds ~60s of audio (48000*60*2 = 5.76MB)
+    if (pcmLen == 0 || pcmLen > 6 * 1024 * 1024) {
+      stderr.writeln('[memefolder] ffmpeg pcm: skipped size=$pcmLen');
+      return null;
+    }
+
+    final pcmBytes = await pcmFile.readAsBytes();
     final samples = Int16List.view(pcmBytes.buffer);
+    stderr.writeln('[memefolder] pcm samples=${samples.length} calling embedAudio');
     final floatPcm = Float32List(samples.length);
     for (int i = 0; i < samples.length; i++) {
       floatPcm[i] = samples[i] / 32768.0;

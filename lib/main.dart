@@ -18,6 +18,8 @@ import 'package:media_kit/media_kit.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:multi_split_view/multi_split_view.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -30,6 +32,16 @@ void main() async {
   setNavigatorKey(navigatorKey);
   await PlayerPrefs.init();
   PlayerPrefs.setInt('launch_count', PlayerPrefs.getInt('launch_count', 0) + 1);
+  // Sync verbose console flag file for C++ startup check
+  try {
+    final dir = await getApplicationSupportDirectory();
+    final flag = File(p.join(dir.path, 'verbose.txt'));
+    if (PlayerPrefs.getBool('verbose_console', true)) {
+      await flag.writeAsString('1');
+    } else {
+      if (await flag.exists()) await flag.delete();
+    }
+  } catch (_) {}
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
   try {

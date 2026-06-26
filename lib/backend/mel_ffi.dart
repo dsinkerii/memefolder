@@ -10,6 +10,10 @@ final class MelFFI {
 
   MelFFI() {
     _lib = _loadLibrary();
+    final melInit = _lib.lookupFunction<Void Function(), void Function()>(
+      'mel_init',
+    );
+    melInit();
     _computeClapMel = _lib.lookupFunction<
         Void Function(Pointer<Float>, Int32, Pointer<Float>),
         void Function(Pointer<Float>, int, Pointer<Float>)>('compute_clap_mel');

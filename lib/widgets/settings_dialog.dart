@@ -54,6 +54,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    bool verboseConsole = PlayerPrefs.getBool('verbose_console', false);
     return Padding(
       padding: const EdgeInsets.all(20),
       child: Column(
@@ -150,6 +151,36 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 onChanged: (v) {
                   PlayerPrefs.setBool('isDarkMode', v);
                   Provider.of<ThemeModel>(context, listen: false).dark = v;
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'verbose console',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurface,
+                ),
+              ),
+              Switch(
+                value: verboseConsole,
+                onChanged: (v) async {
+                  PlayerPrefs.setBool('verbose_console', v);
+                  setState(() {
+                    verboseConsole = v;
+                  });
+                  final dir = await getApplicationSupportDirectory();
+                  final flag = File(p.join(dir.path, 'verbose.txt'));
+                  if (v) {
+                    await flag.writeAsString('1');
+                  } else {
+                    await flag.delete();
+                  }
                 },
               ),
             ],

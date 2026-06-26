@@ -10,6 +10,7 @@ import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/utils/binary_paths.dart';
 import 'package:memefolder/widgets/file_badges.dart';
 import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
@@ -398,7 +399,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     final root = PlayerPrefs.getString("main_folder");
                     final dbExists =
                         root.isNotEmpty &&
-                        File('$root/.memefolder.db').existsSync();
+                        File(p.join(root, '.memefolder.db')).existsSync();
                     return Center(
                       child: Text(
                         dbExists
@@ -779,7 +780,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     if (await thumb.exists()) return thumb;
 
     try {
-      final result = await Process.run('ffmpeg', [
+      final result = await Process.run(ffmpegPath, [
         '-y',
         '-ss',
         '00:00:01',

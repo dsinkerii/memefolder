@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:math';
 
+import 'package:memefolder/utils/binary_paths.dart';
+
 class WaveformGenerator {
   static const int segments = 20;
 
@@ -8,7 +10,7 @@ class WaveformGenerator {
     if (audioPath.isEmpty) return List.filled(segments, 0.5);
 
     try {
-      final result = await Process.run('ffprobe', [
+      final result = await Process.run(ffprobePath, [
         '-v', 'error',
         '-f', 'lavfi',
         '-i', 'amovie=$audioPath,astats=metadata=1:reset=1',

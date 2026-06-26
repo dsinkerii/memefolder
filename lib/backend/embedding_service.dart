@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:memefolder/prefs.dart';
+import 'package:memefolder/utils/crash_logger.dart';
 
 import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 import 'package:path/path.dart' as p;
@@ -41,7 +42,8 @@ class EmbeddingService {
 
   /// Path to directory containing model files
   String? _modelsPath;
-  String get modelsPath => _modelsPath ?? '/tmp/onnx_models';
+  String? get modelsPath => _modelsPath;
+  String? _modelsBasePath;
 
   Timer? _idleTimer;
   int get _idleTimeoutMinutes =>
@@ -85,7 +87,9 @@ class EmbeddingService {
     if (_initialized) return;
 
     final base = modelsPath ?? await _resolveModelsPath();
+    _modelsBasePath = base;
     _modelsPath = tier != null ? p.join(base, tier) : base;
+    debugPrint('[embedding] models path: $_modelsPath');
     if (clipDim != null) this.clipDim = clipDim;
     _mel = MelFFI();
 
@@ -124,23 +128,37 @@ class EmbeddingService {
       GraphOptimizationLevel.ortEnableAll,
     );
 
-    // Load models
-    _clapAudio = OrtSession.fromFile(
-      File(p.join(_modelsPath!, 'clap', 'audio_model_quantized.onnx')),
-      options,
-    );
-    _clapText = OrtSession.fromFile(
-      File(p.join(_modelsPath!, 'clap', 'text_model_quantized.onnx')),
-      options,
-    );
-    _clipVision = OrtSession.fromFile(
-      File(p.join(_modelsPath!, 'clip', 'vision_model.onnx')),
-      options,
-    );
-    _clipText = OrtSession.fromFile(
-      File(p.join(_modelsPath!, 'clip', 'text_model.onnx')),
-      options,
-    );
+    // Load models (fromBuffer to avoid char/wchar_t path encoding on Windows)
+    try {
+      _clapAudio = OrtSession.fromBuffer(
+        await File(p.join(_modelsPath!, 'clap', 'audio_model_quantized.onnx'))
+            .readAsBytes(),
+        options,
+      );
+      _clapText = OrtSession.fromBuffer(
+        await File(p.join(_modelsPath!, 'clap', 'text_model_quantized.onnx'))
+            .readAsBytes(),
+        options,
+      );
+      _clipVision = OrtSession.fromBuffer(
+        await File(p.join(_modelsPath!, 'clip', 'vision_model.onnx'))
+            .readAsBytes(),
+        options,
+      );
+      _clipText = OrtSession.fromBuffer(
+        await File(p.join(_modelsPath!, 'clip', 'text_model.onnx'))
+            .readAsBytes(),
+        options,
+      );
+    } catch (e) {
+      final path = _modelsPath;
+      _modelsPath = null;
+      _modelsBasePath = null;
+      _initialized = false;
+      throw Exception(
+        'Failed to load models from $path: $e',
+      );
+    }
 
     _lastTier = tier;
     _lastGpuProvider = gpuProvider;
@@ -154,7 +172,36 @@ class EmbeddingService {
   Future<Float32List> embedAudio(Float32List pcm48kHz) async {
     await _ensureInitialized();
     _touchIdleTimer();
+
+    if (pcm48kHz.isEmpty) {
+      throw ArgumentError('PCM data is empty');
+    }
+    if (pcm48kHz.length > MelFFI.clapMaxSamples) {
+      throw ArgumentError(
+        'PCM too long: ${pcm48kHz.length} samples (max ${MelFFI.clapMaxSamples})',
+      );
+    }
+    // Check for all-zeros which can cause NaN in mel filterbank
+    bool allZero = true;
+    for (int i = 0; i < pcm48kHz.length && i < 1000; i++) {
+      if (pcm48kHz[i] != 0.0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) {
+      debugPrint('[embed] warning: PCM data is all zeros');
+    }
+
+    CrashLogger.instance.mark('embedAudio:computeClapMel', {
+      'pcmLen': pcm48kHz.length,
+      'allZero': allZero,
+    });
     final mel = _mel!.computeClapMel(pcm48kHz);
+
+    CrashLogger.instance.mark('embedAudio:clapAudio.run', {
+      'melShape': '${mel.length} (1x1x${MelFFI.clapNFrames}x${MelFFI.clapNMels})',
+    });
     final input = OrtValueTensor.createTensorWithDataList(
       [mel],
       [1, 1, MelFFI.clapNFrames, MelFFI.clapNMels],
@@ -168,6 +215,14 @@ class EmbeddingService {
   Future<Float32List> embedImage(Uint8List imageBytes) async {
     await _ensureInitialized();
     _touchIdleTimer();
+
+    if (imageBytes.isEmpty) {
+      throw ArgumentError('Image bytes are empty');
+    }
+
+    CrashLogger.instance.mark('embedImage:decode', {
+      'byteLen': imageBytes.length,
+    });
 
     // Decode and resize to 224x224
     final codec = await ui.instantiateImageCodec(
@@ -200,6 +255,9 @@ class EmbeddingService {
       }
     }
 
+    CrashLogger.instance.mark('embedImage:clipVision.run', {
+      'floatDataLen': floatData.length,
+    });
     final input = OrtValueTensor.createTensorWithDataList(
       [floatData],
       [1, 3, size, size],
@@ -213,6 +271,12 @@ class EmbeddingService {
   Future<Float32List> embedClipText(Int64List tokenIds) async {
     await _ensureInitialized();
     _touchIdleTimer();
+    if (tokenIds.isEmpty) {
+      throw ArgumentError('Token IDs are empty');
+    }
+    CrashLogger.instance.mark('embedClipText:clipText.run', {
+      'tokenLen': tokenIds.length,
+    });
     final input = OrtValueTensor.createTensorWithDataList(
       [tokenIds],
       [1, tokenIds.length],
@@ -226,6 +290,12 @@ class EmbeddingService {
   Future<Float32List> embedClapText(Int64List tokenIds) async {
     await _ensureInitialized();
     _touchIdleTimer();
+    if (tokenIds.isEmpty) {
+      throw ArgumentError('Token IDs are empty');
+    }
+    CrashLogger.instance.mark('embedClapText:clapText.run', {
+      'tokenLen': tokenIds.length,
+    });
     final input = OrtValueTensor.createTensorWithDataList(
       [tokenIds],
       [1, tokenIds.length],
@@ -273,7 +343,7 @@ class EmbeddingService {
     if (_initialized) return;
     if (_lastTier != null) {
       await initialize(
-        modelsPath: _modelsPath,
+        modelsPath: _modelsBasePath,
         tier: _lastTier,
         gpuProvider: _lastGpuProvider,
         clipDim: _lastClipDim,
@@ -315,21 +385,5 @@ class EmbeddingService {
 }
 
 Future<String> _resolveModelsPath() async {
-  final candidates = <String>[
-    p.join(Directory.current.path, 'searchmodels'),
-    p.join((await getApplicationSupportDirectory()).path, 'models'),
-  ];
-
-  for (final path in candidates) {
-    final lowDir = Directory(p.join(path, 'low'));
-    final highDir = Directory(p.join(path, 'high'));
-    // New tier structure
-    if (await lowDir.exists() || await highDir.exists()) return path;
-    // Legacy flat structure
-    final clipDir = Directory(p.join(path, 'clip'));
-    final clapDir = Directory(p.join(path, 'clap'));
-    if (await clipDir.exists() && await clapDir.exists()) return path;
-  }
-
   return p.join((await getApplicationSupportDirectory()).path, 'models');
 }

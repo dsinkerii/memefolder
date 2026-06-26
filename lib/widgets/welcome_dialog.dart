@@ -11,7 +11,7 @@ import 'package:memefolder/widgets/runtime_manager.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:dotted_border/dotted_border.dart';
-import 'package:super_drag_and_drop/super_drag_and_drop.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 
 import 'package:memefolder/backend/system_specs.dart';
 import 'package:memefolder/config/theme.dart';
@@ -875,38 +875,20 @@ class _TutorialDialogState extends State<_TutorialDialog> {
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(vertical: 6),
-                child: DropRegion(
-                  formats: [Formats.zip],
-                  hitTestBehavior: HitTestBehavior.opaque,
-                  onDropOver: (event) {
-                    if (_modelBusy) return DropOperation.none;
-                    final item = event.session.items.first;
-                    if (!item.canProvide(Formats.zip))
-                      return DropOperation.none;
-                    return event.session.allowedOperations.contains(
-                          DropOperation.copy,
-                        )
-                        ? DropOperation.copy
-                        : DropOperation.none;
+                child: DropTarget(
+                  onDragEntered: (_) {
+                    if (!_modelBusy) { setState(() => _dragHoveringZip = true); }
                   },
-                  onDropEnter: (_) {
-                    if (!_modelBusy) setState(() => _dragHoveringZip = true);
-                  },
-                  onDropLeave: (_) {
-                    if (_dragHoveringZip)
+                  onDragExited: (_) {
+                    if (_dragHoveringZip) {
                       setState(() => _dragHoveringZip = false);
+                    }
                   },
-                  onPerformDrop: (event) async {
+                  onDragDone: (details) async {
                     setState(() => _dragHoveringZip = false);
-                    final item = event.session.items.first;
-                    final reader = item.dataReader;
-                    if (reader == null || !reader.canProvide(Formats.zip))
-                      return;
-                    reader.getFile(
-                      Formats.zip,
-                      (file) async => _extractZip(await file.readAll()),
-                      onError: (e) => debugPrint('ZIP drop failed: $e'),
-                    );
+                    final f = details.files.firstOrNull;
+                    if (f == null || !f.name.endsWith('.zip')) return;
+                    _extractZip(await f.readAsBytes());
                   },
                   child: Column(
                     children: [

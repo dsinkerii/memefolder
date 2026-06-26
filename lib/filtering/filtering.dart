@@ -383,7 +383,7 @@ class FilterService extends ChangeNotifier {
     Float32List? queryClip;
     if (_clipMode) {
       final clipTok = HuggingFaceTokenizer.fromFile(
-        '${svc.modelsPath}/clip/tokenizer.json',
+        p.join(svc.modelsPath!, 'clip', 'tokenizer.json'),
       );
       final clipIds = clipTok.encodeClip(_semanticText);
       queryClip = await svc.embedClipText(clipIds);
@@ -391,7 +391,7 @@ class FilterService extends ChangeNotifier {
     Float32List? queryClap;
     if (_clapMode) {
       final clapTok = HuggingFaceTokenizer.fromFile(
-        '${svc.modelsPath}/clap/tokenizer.json',
+        p.join(svc.modelsPath!, 'clap', 'tokenizer.json'),
       );
       final clapIds = clapTok.encodeClap(_semanticText);
       queryClap = await svc.embedClapText(clapIds);

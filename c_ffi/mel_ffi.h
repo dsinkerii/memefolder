@@ -34,6 +34,12 @@ extern "C" {
 #define CLIP_STD_B         0.27577711f
 
 /*
+ * Initialize mel_ffi: install crash handlers.
+ * Must be called once before any other function.
+ */
+MEL_FFI_EXPORT void mel_init(void);
+
+/*
  * Compute CLAP log-mel spectrogram from raw PCM audio.
  *
  * pcm: 48kHz mono PCM samples (float32, range [-1, 1])
