@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:just_audio/just_audio.dart';
 import 'package:memefolder/backend/system_specs.dart';
 import 'package:sqflite/sqflite.dart';
@@ -67,7 +68,9 @@ Future<IndexResult> indexDirectory(
   );
 
   onProgress?.call(0);
-  stderr.writeln('[memefolder] indexDirectory: start path=$currentPath dbExists=$dbExists');
+  stderr.writeln(
+    '[memefolder] indexDirectory: start path=$currentPath dbExists=$dbExists',
+  );
 
   try {
     final totalCount = await _countFiles(currentPath);
@@ -304,6 +307,56 @@ Future<Map<String, String?>> _extractAudioMetadata(String filePath) async {
   }
 }
 
+Future<Map<String, Object?>> _extractVideoInfo(String filePath) async {
+  try {
+    final result = await Process.run(ffprobePath, [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,r_frame_rate,codec_type',
+      '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'json',
+      filePath,
+    ]);
+    if (result.exitCode != 0) return {};
+
+    final json = jsonDecode(result.stdout as String) as Map<String, dynamic>?;
+    if (json == null) return {};
+    final streams = json['streams'] as List<dynamic>? ?? [];
+
+    int? width, height;
+    double? fps;
+    bool hasAudio = false;
+
+    for (final s in streams) {
+      final sMap = s as Map<String, dynamic>;
+      final codecType = sMap['codec_type'] as String?;
+      if (codecType == 'video') {
+        width = sMap['width'] as int?;
+        height = sMap['height'] as int?;
+        final rFrameRate = sMap['r_frame_rate'] as String?;
+        if (rFrameRate != null && rFrameRate.contains('/')) {
+          final parts = rFrameRate.split('/');
+          final num = double.tryParse(parts[0]);
+          final den = double.tryParse(parts[1]);
+          if (num != null && den != null && den > 0) fps = num / den;
+        }
+      } else if (codecType == 'audio') {
+        hasAudio = true;
+      }
+    }
+
+    return {
+      'width': width,
+      'height': height,
+      'fps': fps,
+      'has_audio': hasAudio ? 1 : 0,
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
 Future<int> _countFiles(String rootPath) async {
   var count = 0;
   try {
@@ -325,7 +378,9 @@ Future<IndexResult> _scanAndIndex(
   CancellationToken? cancelToken,
 }) async {
   final db = await openDatabase(dbPath);
-  stderr.writeln('[memefolder] _scanAndIndex: start rootPath=$rootPath totalCount=$totalCount');
+  stderr.writeln(
+    '[memefolder] _scanAndIndex: start rootPath=$rootPath totalCount=$totalCount',
+  );
 
   var indexedCount = 0;
   var embedOk = 0;
@@ -442,8 +497,7 @@ Future<IndexResult> _scanAndIndex(
     final dir = Directory(dirPath);
     if (!await dir.exists()) return;
 
-    final entries = dir.listSync(followLinks: false);
-    for (final entity in entries) {
+    await for (final entity in dir.list(followLinks: false)) {
       try {
         if (cancelToken?.isCancelled ?? false) return;
         final name = p.basename(entity.path);
@@ -466,7 +520,7 @@ Future<IndexResult> _scanAndIndex(
               ? name
               : p.join(relPath, name).replaceAll('\\', '/');
 
-          final stat = entity.statSync();
+          final stat = await entity.stat();
           final ext = p.extension(name).toLowerCase().replaceFirst('.', '');
           final stem = p.basenameWithoutExtension(name);
           final mediaType = _mediaTypeForExt(ext);
@@ -478,101 +532,126 @@ Future<IndexResult> _scanAndIndex(
             audioMeta = await _extractAudioMetadata(entity.path);
           }
 
-        final fileId = await txn.insert('files', {
-          'folder_id': folderId,
-          'rel_path': fileRel,
-          'name': name,
-          'stem': stem,
-          'ext': ext.isEmpty ? null : ext,
-          'media_type': mediaType,
-          'size_bytes': stat.size,
-          'mtime': stat.modified.millisecondsSinceEpoch,
-          'ctime': stat.changed.millisecondsSinceEpoch,
-          'duration_ms': audioMeta['duration_ms'] != null
-              ? int.tryParse(audioMeta['duration_ms']!)
-              : null,
-          'artist': audioMeta['artist'],
-          'album': audioMeta['album'],
-          'genre': audioMeta['genre'],
-          'year': audioMeta['year'] != null
-              ? int.tryParse(audioMeta['year']!)
-              : null,
-          'comment': audioMeta['comment'],
-          'track': audioMeta['track'],
-          'indexed_at': DateTime.now().millisecondsSinceEpoch,
-          'status': 'indexed',
-        }, conflictAlgorithm: ConflictAlgorithm.replace);
-
-        await txn.rawUpdate(
-          'UPDATE folders SET file_count = file_count + 1 WHERE id = ?',
-          [folderId],
-        );
-
-        indexedCount++;
-        if (totalCount > 0) {
-          onProgress?.call(indexedCount / totalCount);
-        }
-
-        if (relPath.isNotEmpty) {
-          final parts = relPath.split('/');
-          final prefixes = <String>[];
-          for (var i = 0; i < parts.length; i++) {
-            prefixes.add(parts.sublist(0, i + 1).join('/'));
+          int? imgWidth, imgHeight;
+          if (mediaType == 'image') {
+            try {
+              final bytes = await File(entity.path).readAsBytes();
+              final codec = await instantiateImageCodec(bytes);
+              final frame = await codec.getNextFrame();
+              imgWidth = frame.image.width;
+              imgHeight = frame.image.height;
+              codec.dispose();
+            } catch (_) {}
           }
-          for (final prefix in prefixes) {
-            final depthParts = prefix.split('/');
-            if (depthParts.length > 5) break;
 
-            final slug = 'folder:$prefix';
-            final display = '@$prefix';
-            final tagId = await ensureTag(txn, slug, display, 'folder');
-            await attachTag(txn, fileId, tagId, 'folder');
+          Map<String, Object?> videoInfo = {};
+          if (mediaType == 'video') {
+            videoInfo = await _extractVideoInfo(entity.path);
           }
-        }
 
-        switch (mediaType) {
-          case 'image':
-            {
-              final tagId = await ensureTag(txn, 'image', '@image', 'type');
-              await attachTag(txn, fileId, tagId, 'system');
-              break;
-            }
-          case 'video':
-            {
-              final tagId = await ensureTag(txn, 'video', '@video', 'type');
-              await attachTag(txn, fileId, tagId, 'system');
-              break;
-            }
-          case 'audio':
-            {
-              final tagId = await ensureTag(txn, 'audio', '@audio', 'type');
-              await attachTag(txn, fileId, tagId, 'system');
-              break;
-            }
-          case 'text':
-            {
-              final tagId = await ensureTag(txn, 'text', '@text', 'type');
-              await attachTag(txn, fileId, tagId, 'system');
-              break;
-            }
-        }
+          final isVideo = mediaType == 'video';
+          final isGif = ext == 'gif';
 
-        if (ext.isNotEmpty) {
-          final slug = '.${ext.toLowerCase()}';
-          final display = '@.$ext';
-          final tagId = await ensureTag(txn, slug, display, 'ext');
-          await attachTag(txn, fileId, tagId, 'system');
-        }
+          final fileId = await txn.insert('files', {
+            'folder_id': folderId,
+            'rel_path': fileRel,
+            'name': name,
+            'stem': stem,
+            'ext': ext.isEmpty ? null : ext,
+            'media_type': mediaType,
+            'size_bytes': stat.size,
+            'mtime': stat.modified.millisecondsSinceEpoch,
+            'ctime': stat.changed.millisecondsSinceEpoch,
+            'width': imgWidth ?? videoInfo['width'] as int?,
+            'height': imgHeight ?? videoInfo['height'] as int?,
+            'duration_ms': audioMeta['duration_ms'] != null
+                ? int.tryParse(audioMeta['duration_ms']!)
+                : null,
+            'fps': videoInfo['fps'] as double?,
+            'has_audio': videoInfo['has_audio'] as int? ?? 0,
+            'has_motion': isVideo || isGif ? 1 : 0,
+            'artist': audioMeta['artist'],
+            'album': audioMeta['album'],
+            'genre': audioMeta['genre'],
+            'year': audioMeta['year'] != null
+                ? int.tryParse(audioMeta['year']!)
+                : null,
+            'comment': audioMeta['comment'],
+            'track': audioMeta['track'],
+            'indexed_at': DateTime.now().millisecondsSinceEpoch,
+            'status': 'indexed',
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
 
-        embedQueue.add(
-          _EmbedJob(
-            fileId: fileId,
-            absPath: entity.path,
-            mediaType: mediaType,
-            audioMeta: audioMeta,
-            fileName: stem,
-          ),
-        );
+          await txn.rawUpdate(
+            'UPDATE folders SET file_count = file_count + 1 WHERE id = ?',
+            [folderId],
+          );
+
+          indexedCount++;
+          if (totalCount > 0) {
+            onProgress?.call(indexedCount / totalCount);
+          }
+
+          if (relPath.isNotEmpty) {
+            final parts = relPath.split('/');
+            final prefixes = <String>[];
+            for (var i = 0; i < parts.length; i++) {
+              prefixes.add(parts.sublist(0, i + 1).join('/'));
+            }
+            for (final prefix in prefixes) {
+              final depthParts = prefix.split('/');
+              if (depthParts.length > 5) break;
+
+              final slug = 'folder:$prefix';
+              final display = '@$prefix';
+              final tagId = await ensureTag(txn, slug, display, 'folder');
+              await attachTag(txn, fileId, tagId, 'folder');
+            }
+          }
+
+          switch (mediaType) {
+            case 'image':
+              {
+                final tagId = await ensureTag(txn, 'image', '@image', 'type');
+                await attachTag(txn, fileId, tagId, 'system');
+                break;
+              }
+            case 'video':
+              {
+                final tagId = await ensureTag(txn, 'video', '@video', 'type');
+                await attachTag(txn, fileId, tagId, 'system');
+                break;
+              }
+            case 'audio':
+              {
+                final tagId = await ensureTag(txn, 'audio', '@audio', 'type');
+                await attachTag(txn, fileId, tagId, 'system');
+                break;
+              }
+            case 'text':
+              {
+                final tagId = await ensureTag(txn, 'text', '@text', 'type');
+                await attachTag(txn, fileId, tagId, 'system');
+                break;
+              }
+          }
+
+          if (ext.isNotEmpty) {
+            final slug = '.${ext.toLowerCase()}';
+            final display = '@.$ext';
+            final tagId = await ensureTag(txn, slug, display, 'ext');
+            await attachTag(txn, fileId, tagId, 'system');
+          }
+
+          embedQueue.add(
+            _EmbedJob(
+              fileId: fileId,
+              absPath: entity.path,
+              mediaType: mediaType,
+              audioMeta: audioMeta,
+              fileName: stem,
+            ),
+          );
         }
       } catch (_) {}
     }
@@ -594,9 +673,22 @@ Future<IndexResult> _scanAndIndex(
       final gpuErr = EmbeddingService.instance.gpuInitError;
       if (gpuProvider != 'CPU' && gpuErr != null) {
         showBubble(
-          Flexible(
-            child: Text(
-              "Loaded! (CPU only. GPU acceleration failed:\n$gpuErr)",
+          Text(
+            "loaded! (CPU only. GPU acceleration failed:\n$gpuErr)",
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              decoration: TextDecoration.none,
+            ),
+            softWrap: true,
+          ),
+        );
+      } else {
+        if (gpuProvider == 'CPU') {
+          showBubble(
+            Text(
+              "loaded! (CPU only)",
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 14,
@@ -605,37 +697,18 @@ Future<IndexResult> _scanAndIndex(
               ),
               softWrap: true,
             ),
-          ),
-        );
-      } else {
-        if (gpuProvider == 'CPU') {
-          showBubble(
-            Flexible(
-              child: Text(
-                "Loaded! (CPU only)",
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w500,
-                  decoration: TextDecoration.none,
-                ),
-                softWrap: true,
-              ),
-            ),
           );
         } else {
           showBubble(
-            Flexible(
-              child: Text(
-                "Loaded! (GPU: $gpuProvider)",
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w500,
-                  decoration: TextDecoration.none,
-                ),
-                softWrap: true,
+            Text(
+              "loaded! (GPU: $gpuProvider)",
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                decoration: TextDecoration.none,
               ),
+              softWrap: true,
             ),
           );
         }
@@ -659,7 +732,7 @@ Future<IndexResult> _scanAndIndex(
             const SizedBox(width: 12),
             const Flexible(
               child: Text(
-                'Models not loaded — embeddings skipped',
+                'Models not loaded - embeddings skipped',
                 style: TextStyle(
                   color: Colors.white,
                   fontSize: 14,
@@ -1156,7 +1229,9 @@ Future<(int, int)> _processEmbedQueue(
   try {
     for (final job in queue) {
       if (cancelToken?.isCancelled ?? false) break;
-      stderr.writeln('[memefolder] embedJob: fileId=${job.fileId} type=${job.mediaType} path=${job.absPath}');
+      stderr.writeln(
+        '[memefolder] embedJob: fileId=${job.fileId} type=${job.mediaType} path=${job.absPath}',
+      );
       try {
         await _embedOneFile(db, svc, tokenizer, job);
         ok++;
@@ -1192,38 +1267,20 @@ Future<void> _embedOneFile(
 ) async {
   final updates = <String, Object?>{};
   final crashLog = CrashLogger.instance;
-  final safeMode = PlayerPrefs.getBool('safe_mode', true);
-  final skipClap = PlayerPrefs.getBool('skip_clap', safeMode);
-  final skipVideo = PlayerPrefs.getBool('skip_video', safeMode);
-
-  crashLog.mark('embedOneFile:start', {
-    'absPath': job.absPath,
-    'safeMode': safeMode,
-    'skipClap': skipClap,
-    'skipVideo': skipVideo,
-  });
 
   try {
-    if (skipVideo && job.mediaType == 'video') {
-      stderr.writeln('[memefolder] skip clip embedding for video (safe mode)');
-    } else {
-      final clipEmb = await _embedClipForFile(svc, tokenizer, job);
-      if (clipEmb != null && clipEmb.length == svc.clipDim) {
-        updates['clip_emb'] = clipEmb.buffer.asUint8List();
-      }
+    final clipEmb = await _embedClipForFile(svc, tokenizer, job);
+    if (clipEmb != null && clipEmb.length == svc.clipDim) {
+      updates['clip_emb'] = clipEmb.buffer.asUint8List();
     }
   } catch (e) {
     debugPrint('[embed] clip embedding failed for ${job.absPath}: $e');
   }
 
   try {
-    if (skipClap && (job.mediaType == 'audio' || job.mediaType == 'video')) {
-      stderr.writeln('[memefolder] skip clap embedding for ${job.mediaType} (safe mode)');
-    } else {
-      final clapEmb = await _embedClapForFile(svc, job);
-      if (clapEmb != null && clapEmb.length == svc.clapDim) {
-        updates['clap_emb'] = clapEmb.buffer.asUint8List();
-      }
+    final clapEmb = await _embedClapForFile(svc, job);
+    if (clapEmb != null && clapEmb.length == svc.clapDim) {
+      updates['clap_emb'] = clapEmb.buffer.asUint8List();
     }
   } catch (e) {
     debugPrint('[embed] clap embedding failed for ${job.absPath}: $e');
@@ -1302,7 +1359,9 @@ Future<Float32List?> _embedClipForFile(
         'image2',
         keyframePath,
       ]);
-      stderr.writeln('[memefolder] ffmpeg keyframe: exitCode=${result.exitCode} stderr=${result.stderr}');
+      stderr.writeln(
+        '[memefolder] ffmpeg keyframe: exitCode=${result.exitCode} stderr=${result.stderr}',
+      );
       if (result.exitCode != 0) return null;
       final keyframe = File(keyframePath);
       if (!await keyframe.exists() || await keyframe.length() == 0) {
@@ -1310,7 +1369,9 @@ Future<Float32List?> _embedClipForFile(
         return null;
       }
       final bytes = await keyframe.readAsBytes();
-      stderr.writeln('[memefolder] ffmpeg keyframe: size=${bytes.length} calling embedImage');
+      stderr.writeln(
+        '[memefolder] ffmpeg keyframe: size=${bytes.length} calling embedImage',
+      );
       final emb = await svc.embedImage(bytes);
       return emb;
     } finally {
@@ -1350,7 +1411,9 @@ Future<Float32List?> _embedClapForFile(
     }
     args.add(pcmPath);
     final result = await Process.run(ffmpegPath, args);
-    stderr.writeln('[memefolder] ffmpeg pcm: exitCode=${result.exitCode} stderr=${result.stderr}');
+    stderr.writeln(
+      '[memefolder] ffmpeg pcm: exitCode=${result.exitCode} stderr=${result.stderr}',
+    );
     if (result.exitCode != 0) return null;
 
     final pcmFile = File(pcmPath);
@@ -1359,7 +1422,7 @@ Future<Float32List?> _embedClapForFile(
       return null;
     }
     final pcmLen = await pcmFile.length();
-    // Skip if PCM is empty or exceeds ~60s of audio (48000*60*2 = 5.76MB)
+    // skip if PCM is empty or exceeds ~60s of audio (48000*60*2 = 5.76MB)
     if (pcmLen == 0 || pcmLen > 6 * 1024 * 1024) {
       stderr.writeln('[memefolder] ffmpeg pcm: skipped size=$pcmLen');
       return null;
@@ -1367,7 +1430,9 @@ Future<Float32List?> _embedClapForFile(
 
     final pcmBytes = await pcmFile.readAsBytes();
     final samples = Int16List.view(pcmBytes.buffer);
-    stderr.writeln('[memefolder] pcm samples=${samples.length} calling embedAudio');
+    stderr.writeln(
+      '[memefolder] pcm samples=${samples.length} calling embedAudio',
+    );
     final floatPcm = Float32List(samples.length);
     for (int i = 0; i < samples.length; i++) {
       floatPcm[i] = samples[i] / 32768.0;

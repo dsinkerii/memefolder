@@ -286,17 +286,15 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             _busy = false;
             _statusMsg = 'Models loaded, but GPU acceleration failed:\n$gpuErr';
             showBubble(
-              Flexible(
-                child: Text(
-                  "Loaded! (CPU only. GPU acceleration failed:\n$gpuErr)",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    decoration: TextDecoration.none,
-                  ),
-                  softWrap: true,
+              Text(
+                "Loaded! (CPU only. GPU acceleration failed:\n$gpuErr)",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
                 ),
+                softWrap: true,
               ),
             );
           });
@@ -305,33 +303,29 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           if (gpuProvider == null || gpuProvider == 'CPU') {
             setState(() => _statusMsg = 'Loaded! (CPU only)');
             showBubble(
-              Flexible(
-                child: Text(
-                  "Loaded! (CPU only)",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    decoration: TextDecoration.none,
-                  ),
-                  softWrap: true,
+              Text(
+                "Loaded! (CPU only)",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
                 ),
+                softWrap: true,
               ),
             );
           } else {
             setState(() => _statusMsg = 'Loaded! (GPU: $gpuProvider)');
             showBubble(
-              Flexible(
-                child: Text(
-                  "Loaded! (GPU: $gpuProvider)",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    decoration: TextDecoration.none,
-                  ),
-                  softWrap: true,
+              Text(
+                "Loaded! (GPU: $gpuProvider)",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
                 ),
+                softWrap: true,
               ),
             );
           }

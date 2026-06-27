@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -58,12 +60,23 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   String? _selectedPath;
   String? _lastPressedPath;
   DateTime? _lastPressedAt;
-  late Future<List<FileSystemEntity>> _entitiesFuture;
   late Future<IndexStatus> _indexedFilesFuture;
   final Map<String, Future<File?>> _videoThumbnailFutures = {};
+  int _thumbnailSlots = 2;
+  final Queue<Completer<void>> _thumbnailWaiters = Queue();
+  bool _thumbnailQueueCancelled = false;
   ValueNotifier<bool> isReindexing = ValueNotifier(false);
   ValueNotifier<double> indexProgress = ValueNotifier(0.0);
   CancellationToken? _cancelToken;
+
+  List<FileSystemEntity> _loadedEntities = [];
+  bool _isLoadingEntities = true;
+  bool _hasMoreEntities = false;
+  int _totalEntityCount = 0;
+  StreamSubscription<FileSystemEntity>? _dirSub;
+  static const int _batchSize = 200;
+
+  ScrollController? _lastController;
 
   List<String> _suggestions = [];
   int _selectedSuggestionIndex = -1;
@@ -80,6 +93,12 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   @override
   void dispose() {
     FilterService.instance.removeListener(_onFilterChanged);
+    _dirSub?.cancel();
+    _lastController?.removeListener(_onScroll);
+    _thumbnailQueueCancelled = true;
+    while (_thumbnailWaiters.isNotEmpty) {
+      _thumbnailWaiters.removeFirst().complete();
+    }
     _removeSuggestionsOverlay();
     _hoveredPath = null;
     super.dispose();
@@ -87,33 +106,167 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
 
   void _onFilterChanged() {
     _loadData();
-    if (mounted) setState(() {});
   }
 
   Future<void> _loadData() async {
+    _dirSub?.cancel();
+    _lastController?.removeListener(_onScroll);
+    _lastController = null;
+    _thumbnailQueueCancelled = true;
+    while (_thumbnailWaiters.isNotEmpty) {
+      _thumbnailWaiters.removeFirst().complete();
+    }
+    _thumbnailSlots = 2;
+    _thumbnailQueueCancelled = false;
+    _loadedEntities = [];
+    _isLoadingEntities = true;
+    _hasMoreEntities = false;
+    if (mounted) setState(() {});
+
     final isActive = FilterService.instance.isActive;
-    final root = PlayerPrefs.getString("main_folder");
     if (isActive) {
+      final root = PlayerPrefs.getString("main_folder");
       if (root.isNotEmpty) {
-        _entitiesFuture = _getFilteredEntities(root);
+        final filter = FilterService.instance;
+        final paths = await filter.execute(root);
+        final scores = filter.scores;
+        final sorted = paths.toList()
+          ..sort((a, b) => (scores[b] ?? 0).compareTo(scores[a] ?? 0));
+        if (mounted) {
+          setState(() {
+            _loadedEntities = sorted
+                .map((p) => File(p))
+                .where((e) => !p.basename(e.path).startsWith('.'))
+                .toList();
+            _isLoadingEntities = false;
+            _hasMoreEntities = false;
+          });
+        }
       } else {
-        _entitiesFuture = Future.value(<FileSystemEntity>[]);
+        if (mounted) setState(() => _isLoadingEntities = false);
       }
     } else {
-      _entitiesFuture = Directory(widget.currentPath).list().toList();
+      _loadDirectoryData();
     }
     _indexedFilesFuture = getIndexedFiles(widget.currentPath);
   }
 
-  Future<List<FileSystemEntity>> _getFilteredEntities(String rootPath) async {
-    final filter = FilterService.instance;
-    if (!filter.isActive) return [];
+  void _loadDirectoryData() {
+    _loadedEntities = [];
+    _totalEntityCount = 0;
+    int batchCount = 0;
+    _isLoadingEntities = true;
+    _hasMoreEntities = true;
+    _countTotalEntities(widget.currentPath);
 
-    final paths = await filter.execute(rootPath);
-    final scores = filter.scores;
-    final sorted = paths.toList()
-      ..sort((a, b) => (scores[b] ?? 0).compareTo(scores[a] ?? 0));
-    return sorted.map((p) => File(p)).toList();
+    _dirSub = Directory(widget.currentPath).list().listen(
+      (entity) {
+        if (p.basename(entity.path).startsWith('.')) return;
+        _loadedEntities.add(entity);
+        batchCount++;
+
+        if (batchCount >= _batchSize) {
+          _dirSub?.pause();
+          batchCount = 0;
+          _sortLoadedEntities();
+          if (mounted) setState(() => _isLoadingEntities = false);
+        }
+      },
+      onDone: () {
+        _sortLoadedEntities();
+        if (mounted) {
+          setState(() {
+            _isLoadingEntities = false;
+            _hasMoreEntities = false;
+          });
+        }
+      },
+      onError: (_) {
+        if (mounted) {
+          setState(() {
+            _isLoadingEntities = false;
+            _hasMoreEntities = false;
+          });
+        }
+      },
+    );
+  }
+
+  Future<void> _countTotalEntities(String path) async {
+    int count = 0;
+    try {
+      await for (final entity in Directory(path).list()) {
+        if (!p.basename(entity.path).startsWith('.')) count++;
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _totalEntityCount = count);
+  }
+
+  void _loadMoreEntities() {
+    if (_hasMoreEntities && !_isLoadingEntities) {
+      _isLoadingEntities = true;
+      if (mounted) setState(() {});
+      _dirSub?.resume();
+    }
+  }
+
+  void _sortLoadedEntities() {
+    if (FilterService.instance.isActive) return;
+    _loadedEntities.sort((a, b) {
+      final aIsDir = FileManager.isDirectory(a);
+      final bIsDir = FileManager.isDirectory(b);
+      if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
+      return p
+          .basename(a.path)
+          .toLowerCase()
+          .compareTo(p.basename(b.path).toLowerCase());
+    });
+  }
+
+  Widget _buildLoadingBar() {
+    final progress = _totalEntityCount > 0
+        ? (_loadedEntities.length / _totalEntityCount).clamp(0.0, 1.0)
+        : null;
+    return Positioned(
+      bottom: 0,
+      left: 0,
+      right: 0,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          LinearProgressIndicator(value: progress),
+          if (_totalEntityCount > 0)
+            Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Text(
+                '${_loadedEntities.length} / $_totalEntityCount',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _ensureScrollListener(ScrollController controller) {
+    if (_lastController != controller) {
+      _lastController?.removeListener(_onScroll);
+      _lastController = controller;
+      controller.addListener(_onScroll);
+    }
+  }
+
+  void _onScroll() {
+    final controller = _lastController;
+    if (controller == null || !controller.hasClients) return;
+    if (!_hasMoreEntities || _isLoadingEntities) return;
+    if (controller.position.pixels >=
+        controller.position.maxScrollExtent - 500) {
+      _loadMoreEntities();
+    }
   }
 
   @override
@@ -360,128 +513,118 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
             child: child,
           ),
         ),
-        child: FutureBuilder<List<FileSystemEntity>>(
+        child: FutureBuilder<IndexStatus>(
           key: ValueKey(
             "${widget.currentPath}-${widget.isGrid}-${widget.folderScale}",
           ),
-          future: _entitiesFuture,
-          builder: (context, entitiesSnapshot) => FutureBuilder<IndexStatus>(
-            future: _indexedFilesFuture,
-            builder: (context, indexedSnapshot) => SilkyScroll(
-              builder: (context, controller, physics, pointerDeviceKind) {
-                if (entitiesSnapshot.hasError) {
+          future: _indexedFilesFuture,
+          builder: (context, indexedSnapshot) => SilkyScroll(
+            builder: (context, controller, physics, pointerDeviceKind) {
+              _ensureScrollListener(controller);
+
+              if (_isLoadingEntities && _loadedEntities.isEmpty) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              final entities = _loadedEntities;
+              final isFiltering = FilterService.instance.isActive;
+
+              if (entities.isEmpty) {
+                if (isFiltering) {
+                  final root = PlayerPrefs.getString("main_folder");
+                  final dbExists =
+                      root.isNotEmpty &&
+                      File(p.join(root, '.memefolder.db')).existsSync();
                   return Center(
-                    child: Text("Error: ${entitiesSnapshot.error}"),
+                    child: Text(
+                      dbExists
+                          ? "no results"
+                          : "(!) please index directory to enable search (!)",
+                    ),
                   );
                 }
-                if (!entitiesSnapshot.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+                return const Center(child: Text("Empty Directory"));
+              }
 
-                var entities = entitiesSnapshot.data!
-                    .where((e) => !p.basename(e.path).startsWith('.'))
-                    .toList();
+              final indexedStatus = indexedSnapshot.data ?? const IndexStatus();
+              final indexedFiles = indexedStatus.indexed;
+              final failedFiles = indexedStatus.failed;
+              final zoom = 0.75 + (widget.folderScale * 1.25);
+              final listColumns = 1 + (widget.folderScale * 3).round();
+              final gridCellWidth = 88.0 * zoom;
+              final gridCellHeight = 120.0 * zoom;
+              final iconSize = 44.0 * zoom;
+              final listRowHeight = 52.0 * zoom;
+              final listIconSize = 28.0 * zoom;
+              final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
 
-                final isFiltering = FilterService.instance.isActive;
-                if (!isFiltering) {
-                  entities.sort((a, b) {
-                    final aIsDir = FileManager.isDirectory(a);
-                    final bIsDir = FileManager.isDirectory(b);
-                    if (aIsDir != bIsDir) return aIsDir ? -1 : 1;
-                    return p.basename(a.path).toLowerCase().compareTo(
-                      p.basename(b.path).toLowerCase(),
-                    );
-                  });
-                }
-
-                if (entities.isEmpty) {
-                  if (isFiltering) {
-                    final root = PlayerPrefs.getString("main_folder");
-                    final dbExists =
-                        root.isNotEmpty &&
-                        File(p.join(root, '.memefolder.db')).existsSync();
-                    return Center(
-                      child: Text(
-                        dbExists
-                            ? "no results"
-                            : "(!) please index directory to enable search (!)",
+              if (widget.isGrid) {
+                return Stack(
+                  children: [
+                    GridView.builder(
+                      padding: const EdgeInsets.all(8),
+                      controller: controller,
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: gridCellWidth,
+                        mainAxisExtent: gridCellHeight,
+                        mainAxisSpacing: 8,
+                        crossAxisSpacing: 8,
                       ),
-                    );
-                  }
-                  return const Center(child: Text("Empty Directory"));
-                }
-
-                final indexedStatus =
-                    indexedSnapshot.data ?? const IndexStatus();
-                final indexedFiles = indexedStatus.indexed;
-                final failedFiles = indexedStatus.failed;
-                final zoom = 0.75 + (widget.folderScale * 1.25);
-                final listColumns = 1 + (widget.folderScale * 3).round();
-                final gridCellWidth = 88.0 * zoom;
-                final gridCellHeight = 120.0 * zoom;
-                final iconSize = 44.0 * zoom;
-                final listRowHeight = 52.0 * zoom;
-                final listIconSize = 28.0 * zoom;
-                final labelSize = 11.0 * zoom.clamp(1.0, 1.35);
-
-                if (widget.isGrid) {
-                  return GridView.builder(
-                    padding: const EdgeInsets.all(8),
-                    controller: controller,
-                    gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: gridCellWidth,
-                      mainAxisExtent: gridCellHeight,
-                      mainAxisSpacing: 8,
-                      crossAxisSpacing: 8,
+                      itemCount: entities.length,
+                      itemBuilder: (context, index) {
+                        final e = entities[index];
+                        final isDir = FileManager.isDirectory(e);
+                        return _buildGridTile(
+                          context: context,
+                          isDir: isDir,
+                          entity: e,
+                          isHovered: _hoveredPath == e.path,
+                          isSelected: _selectedPath == e.path,
+                          isIndexed:
+                              !isDir &&
+                              (isFiltering || indexedFiles.contains(e.path)),
+                          isFailed: failedFiles.contains(e.path),
+                          iconSize: iconSize,
+                          gridWidth: gridCellWidth,
+                          labelSize: labelSize,
+                        );
+                      },
                     ),
-                    itemCount: entities.length,
-                    itemBuilder: (context, index) {
-                      final e = entities[index];
-                      final isDir = FileManager.isDirectory(e);
-                      return _buildGridTile(
-                        context: context,
-                        isDir: isDir,
-                        entity: e,
-                        isHovered: _hoveredPath == e.path,
-                        isSelected: _selectedPath == e.path,
-                        isIndexed:
-                            !isDir &&
-                            (isFiltering || indexedFiles.contains(e.path)),
-                        isFailed: failedFiles.contains(e.path),
-                        iconSize: iconSize,
-                        gridWidth: gridCellWidth,
-                        labelSize: labelSize,
-                      );
-                    },
-                  );
-                } else {
-                  return GridView.builder(
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: listColumns,
-                      mainAxisExtent: listRowHeight,
+                    if (_isLoadingEntities) _buildLoadingBar(),
+                  ],
+                );
+              } else {
+                return Stack(
+                  children: [
+                    GridView.builder(
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: listColumns,
+                        mainAxisExtent: listRowHeight,
+                      ),
+                      controller: controller,
+                      itemCount: entities.length,
+                      itemBuilder: (context, index) {
+                        final e = entities[index];
+                        final isDir = FileManager.isDirectory(e);
+                        return _buildListTile(
+                          context: context,
+                          isDir: isDir,
+                          entity: e,
+                          isHovered: _hoveredPath == e.path,
+                          isSelected: _selectedPath == e.path,
+                          isIndexed:
+                              !isDir &&
+                              (isFiltering || indexedFiles.contains(e.path)),
+                          isFailed: failedFiles.contains(e.path),
+                          iconSize: listIconSize,
+                        );
+                      },
                     ),
-                    controller: controller,
-                    itemCount: entities.length,
-                    itemBuilder: (context, index) {
-                      final e = entities[index];
-                      final isDir = FileManager.isDirectory(e);
-                      return _buildListTile(
-                        context: context,
-                        isDir: isDir,
-                        entity: e,
-                        isHovered: _hoveredPath == e.path,
-                        isSelected: _selectedPath == e.path,
-                        isIndexed:
-                            !isDir &&
-                            (isFiltering || indexedFiles.contains(e.path)),
-                        isFailed: failedFiles.contains(e.path),
-                        iconSize: listIconSize,
-                      );
-                    },
-                  );
-                }
-              },
-            ),
+                    if (_isLoadingEntities) _buildLoadingBar(),
+                  ],
+                );
+              }
+            },
           ),
         ),
       ),
@@ -506,12 +649,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                     onProgress: (p) => indexProgress.value = p,
                     cancelToken: _cancelToken,
                   );
-                  setState(() {
-                    _indexedFilesFuture = getIndexedFiles(widget.currentPath);
-                    _entitiesFuture = Directory(
-                      widget.currentPath,
-                    ).list().toList();
-                  });
+                  _indexedFilesFuture = getIndexedFiles(widget.currentPath);
+                  _loadDirectoryData();
                   indexProgress.value = 0;
                   isReindexing.value = false;
                 },
@@ -779,6 +918,12 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     final thumb = File('${Directory.systemTemp.path}/memefolder-$safeName.png');
     if (await thumb.exists()) return thumb;
 
+    await _acquireThumbnailSlot();
+    if (await thumb.exists()) {
+      _releaseThumbnailSlot();
+      return thumb;
+    }
+
     try {
       final result = await Process.run(ffmpegPath, [
         '-y',
@@ -795,9 +940,30 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       if (result.exitCode == 0 && await thumb.exists()) return thumb;
     } catch (_) {
       return null;
+    } finally {
+      _releaseThumbnailSlot();
     }
 
     return null;
+  }
+
+  Future<void> _acquireThumbnailSlot() async {
+    if (_thumbnailQueueCancelled) return;
+    if (_thumbnailSlots > 0) {
+      _thumbnailSlots--;
+      return;
+    }
+    final completer = Completer<void>();
+    _thumbnailWaiters.add(completer);
+    return completer.future;
+  }
+
+  void _releaseThumbnailSlot() {
+    if (_thumbnailWaiters.isNotEmpty) {
+      _thumbnailWaiters.removeFirst().complete();
+    } else {
+      _thumbnailSlots++;
+    }
   }
 }
 
@@ -949,8 +1115,8 @@ class _PreviewBadge extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
           child: Text(
             label,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.primary,
               fontSize: 8,
               fontWeight: FontWeight.w700,
             ),
@@ -1003,10 +1169,7 @@ class _DualScoreBadge extends StatelessWidget {
     return Positioned(
       top: 2,
       left: 2,
-      child: _Chip(
-        label: '${best.round()}%',
-        color: _scoreColor(cs, best),
-      ),
+      child: _Chip(label: '${best.round()}%', color: _scoreColor(cs, best)),
     );
   }
 }
@@ -1029,8 +1192,8 @@ class _Chip extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
           child: Text(
             label,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: readableOn(color),
               fontSize: 8,
               fontWeight: FontWeight.w700,
             ),

@@ -211,9 +211,7 @@ class _InfoBubbleState extends State<_InfoBubble>
         subtitle = 'you\'re on $appVersion - grab v$latest on GitHub!';
         icon = Icons.system_update;
         onPress = () {
-          _openLink(
-            'https://github.com/dsinkerii/memefolder/releases/latest',
-          );
+          _openLink('https://github.com/dsinkerii/memefolder/releases/latest');
         };
         onDismiss = () {
           PlayerPrefs.setString('github_dismissed_version', latest);
@@ -1442,8 +1440,11 @@ class _MediaPreviewState extends State<_MediaPreview> {
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.videocam_off_rounded,
-                            color: Colors.white38, size: 48),
+                        Icon(
+                          Icons.videocam_off_rounded,
+                          color: Colors.white38,
+                          size: 48,
+                        ),
                         SizedBox(height: 8),
                         Text(
                           'video playback unavailable',
@@ -1567,9 +1568,9 @@ class _MediaPreviewState extends State<_MediaPreview> {
                         },
                       ),
 
-                      ConstrainedBox(
-                        constraints: BoxConstraints(maxWidth: 160),
-                        child: Expanded(
+                      Expanded(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(maxWidth: 160),
                           child: SliderTheme(
                             data: SliderThemeData(
                               thumbShape: const RoundSliderThumbShape(

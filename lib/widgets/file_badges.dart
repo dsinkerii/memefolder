@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:memefolder/config/theme.dart';
 
 class IndexedBadge extends StatelessWidget {
   final double size;
@@ -16,7 +17,11 @@ class IndexedBadge extends StatelessWidget {
         ),
         child: Padding(
           padding: const EdgeInsets.all(2),
-          child: Icon(Icons.check, color: Colors.white, size: size),
+          child: Icon(
+            Icons.check,
+            color: readableOn(Theme.of(context).colorScheme.primary),
+            size: size,
+          ),
         ),
       ),
     );
@@ -33,7 +38,7 @@ class FailedBadge extends StatelessWidget {
       right: 2,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: Colors.red.shade700,
+          color: Theme.of(context).colorScheme.error,
           borderRadius: BorderRadius.circular(3),
         ),
         child: const Padding(

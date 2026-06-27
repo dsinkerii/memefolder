@@ -11,6 +11,70 @@ import 'package:path/path.dart' as p;
 import 'package:memefolder/prefs.dart';
 import 'package:sqflite/sqflite.dart';
 
+double _cosineSimilarity(Float32List a, Float32List b) {
+  double dot = 0, na = 0, nb = 0;
+  for (int i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na == 0 || nb == 0) return 0;
+  return dot / (sqrt(na) * sqrt(nb));
+}
+
+List<Map<String, Object?>> _computeScoresInIsolate(
+  Map<String, Object?> params,
+) {
+  final queryClip = params['queryClip'] as Float32List?;
+  final queryClap = params['queryClap'] as Float32List?;
+  final clipDim = params['clipDim'] as int;
+  final clapDim = params['clapDim'] as int;
+  final cd4 = clipDim * 4;
+  final ad4 = clapDim * 4;
+  final filePaths = params['filePaths'] as List<String>;
+  final statuses = params['statuses'] as List<String>;
+  final clipBlobs = params['clipBlobs'] as List<Uint8List?>;
+  final clapBlobs = params['clapBlobs'] as List<Uint8List?>;
+
+  final results = <Map<String, Object?>>[];
+  for (int i = 0; i < filePaths.length; i++) {
+    final absPath = filePaths[i];
+    final status = statuses[i];
+
+    double? clipScore;
+    double? clapScore;
+    double bestScore = 0.0;
+
+    if (queryClip != null && clipBlobs[i] != null) {
+      final blob = clipBlobs[i]!;
+      if (blob.length == cd4) {
+        final emb = Float32List.view(blob.buffer, 0, clipDim);
+        clipScore = _cosineSimilarity(queryClip, emb);
+        if (clipScore > bestScore) bestScore = clipScore;
+      }
+    }
+
+    if (queryClap != null && clapBlobs[i] != null) {
+      final blob = clapBlobs[i]!;
+      if (blob.length == ad4) {
+        final emb = Float32List.view(blob.buffer, 0, clapDim);
+        clapScore = _cosineSimilarity(queryClap, emb);
+        if (clapScore > bestScore) bestScore = clapScore;
+      }
+    }
+
+    if (status == 'embed_failed') bestScore = -1;
+
+    results.add({
+      'path': absPath,
+      'clipScore': clipScore,
+      'clapScore': clapScore,
+      'bestScore': bestScore,
+    });
+  }
+  return results;
+}
+
 sealed class FilterExpr {}
 
 class TagFilter extends FilterExpr {
@@ -59,6 +123,35 @@ const _typeAliasMap = <String, String>{
   'text': 'text',
 };
 
+int? _parseDateToMs(String raw) {
+  raw = raw.trim();
+  if (raw == 'today') {
+    final now = DateTime.now();
+    return DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+  }
+  if (raw == 'yesterday') {
+    final now = DateTime.now().subtract(const Duration(days: 1));
+    return DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+  }
+  final ts = int.tryParse(raw);
+  if (ts != null) return ts < 1e12 ? ts * 1000 : ts;
+  try {
+    final d = DateTime.parse(raw);
+    return d.millisecondsSinceEpoch;
+  } catch (_) {}
+  return null;
+}
+
+final _logicalTagMap = <String, String>{
+  'size': 'size_bytes',
+  'length': 'duration_ms',
+  'duration': 'duration_ms',
+  'width': 'width',
+  'height': 'height',
+  'fps': 'fps',
+  'date': 'mtime',
+};
+
 TagFilter? _tokenToFilter(Token token) {
   final raw = token.value;
 
@@ -80,6 +173,35 @@ TagFilter? _tokenToFilter(Token token) {
     final path = raw.substring(8);
     if (path.isEmpty) return null;
     return TagFilter('rel_path', 'LIKE', '$path/%');
+  }
+
+  if (token.type is TokTagLogical) {
+    // parse @tag>value, @tag<value, @tag=value, @tag>=value, @tag<=value
+    final match = RegExp(r'^@(\w+)([<>=]=?)(.+)$').firstMatch(raw);
+    if (match == null) return null;
+    final tag = match.group(1)!.toLowerCase();
+    final op = match.group(2)!;
+    final val = match.group(3)!.trim();
+
+    final column = _logicalTagMap[tag];
+    if (column == null) return null;
+
+    if (tag == 'date') {
+      final ms = _parseDateToMs(val);
+      if (ms == null) return null;
+      return TagFilter(column, op, ms.toString());
+    }
+
+    // fp → SQL operator (replace = with == for SQLite compatibility)
+    final sqlOp = op == '=' ? '=' : op;
+    return TagFilter(column, sqlOp, val);
+  }
+
+  if (token.type is TokTagModality) {
+    final tag = raw.substring(1); // remove '@'
+    // tag is like 'has:audio', 'has:speech', 'has:text', 'has:motion'
+    final col = tag.replaceAll(':', '_');
+    return TagFilter(col, '=', '1');
   }
 
   return null;
@@ -148,7 +270,8 @@ class _Parser {
     if (tok.type is TokTagFiletype ||
         tok.type is TokTagFileext ||
         tok.type is TokTagFolder ||
-        tok.type is TokTagLogical) {
+        tok.type is TokTagLogical ||
+        tok.type is TokTagModality) {
       _pos++;
       return _tokenToFilter(tok);
     }
@@ -167,6 +290,7 @@ FilterExpr? parseFilterExpression(String query) {
         ty is TokTagFileext ||
         ty is TokTagFolder ||
         ty is TokTagLogical ||
+        ty is TokTagModality ||
         ty is TokOpAnd ||
         ty is TokOpOr ||
         ty is TokOpNot ||
@@ -332,7 +456,7 @@ class FilterService extends ChangeNotifier {
               const SizedBox(width: 12),
               const Flexible(
                 child: Text(
-                  'No embedding models loaded — download first',
+                  'No embedding models loaded - download first',
                   style: TextStyle(
                     color: Colors.white,
                     fontSize: 14,
@@ -437,7 +561,7 @@ class FilterService extends ChangeNotifier {
           }
         }
       } catch (_) {
-        // old schema without model_tier column — ignore
+        // old schema without model_tier column - ignore
       }
       final mediaWhere = <String>[];
       if (_clipMode) {
@@ -455,53 +579,40 @@ class FilterService extends ChangeNotifier {
       ''', mediaList);
 
       final cd = EmbeddingService.instance.clipDim;
-      final cd4 = cd * 4;
       final ad = EmbeddingService.instance.clapDim;
-      final ad4 = ad * 4;
+
+      final filePaths = <String>[];
+      final statuses = <String>[];
+      final clipBlobs = <Uint8List?>[];
+      final clapBlobs = <Uint8List?>[];
 
       for (final row in rows) {
-        final relPath = row['rel_path'] as String;
-        final absPath = p.join(rootPath, relPath);
-        final status = row['status'] as String? ?? '';
+        filePaths.add(p.join(rootPath, row['rel_path'] as String));
+        statuses.add(row['status'] as String? ?? '');
+        clipBlobs.add(row['clip_emb'] as Uint8List?);
+        clapBlobs.add(row['clap_emb'] as Uint8List?);
+      }
 
-        double? clipScore;
-        double? clapScore;
-        double bestScore = 0.0;
+      final params = <String, Object?>{
+        'queryClip': queryClip,
+        'queryClap': queryClap,
+        'clipDim': cd,
+        'clapDim': ad,
+        'filePaths': filePaths,
+        'statuses': statuses,
+        'clipBlobs': clipBlobs,
+        'clapBlobs': clapBlobs,
+      };
 
-        if (queryClip != null && row['clip_emb'] is Uint8List) {
-          final blob = row['clip_emb'] as Uint8List;
-          if (blob.length == cd4) {
-            final fileEmb = Float32List.view(blob.buffer, 0, cd);
-            clipScore = _cosineSimilarity(queryClip, fileEmb);
-            if (clipScore > bestScore) bestScore = clipScore;
-          }
-        }
+      final results = await compute(_computeScoresInIsolate, params);
 
-        if (clipScore == null &&
-            queryClip != null &&
-            row['metadata_emb'] is Uint8List) {
-          final blob = row['metadata_emb'] as Uint8List;
-          if (blob.length == cd4) {
-            final fileEmb = Float32List.view(blob.buffer, 0, cd);
-            clipScore = _cosineSimilarity(queryClip, fileEmb);
-            if (clipScore > bestScore) bestScore = clipScore;
-          }
-        }
-
-        if (queryClap != null && row['clap_emb'] is Uint8List) {
-          final blob = row['clap_emb'] as Uint8List;
-          if (blob.length == ad4) {
-            final fileEmb = Float32List.view(blob.buffer, 0, ad);
-            clapScore = _cosineSimilarity(queryClap, fileEmb);
-            if (clapScore > bestScore) bestScore = clapScore;
-          }
-        }
-
+      for (final r in results) {
+        final absPath = r['path'] as String;
+        final clipScore = r['clipScore'] as double?;
+        final clapScore = r['clapScore'] as double?;
+        final bestScore = r['bestScore'] as double;
         _clipScores[absPath] = clipScore;
         _clapScores[absPath] = clapScore;
-        if (status == 'embed_failed') {
-          bestScore = -1;
-        }
         _scores[absPath] = bestScore;
       }
     } finally {
@@ -510,6 +621,7 @@ class FilterService extends ChangeNotifier {
 
     if (_scores.isEmpty) return [];
 
+    // min-max normalize each score map to [0, 100]
     void normalizeMap(Map<String, double?> map) {
       final keys = map.keys
           .where((k) => map[k] != null && _scores[k]! >= 0)
@@ -530,7 +642,6 @@ class FilterService extends ChangeNotifier {
       }
     }
 
-    // Normalize combined, clip, and clap scores independently
     normalizeMap(_scores.cast<String, double?>());
     normalizeMap(_clipScores);
     normalizeMap(_clapScores);
@@ -546,16 +657,5 @@ class FilterService extends ChangeNotifier {
 
     debugPrint('[filter] semantic: ${sorted.length} results');
     return sorted.map((e) => e.key).toList();
-  }
-
-  static double _cosineSimilarity(Float32List a, Float32List b) {
-    double dot = 0, na = 0, nb = 0;
-    for (int i = 0; i < a.length; i++) {
-      dot += a[i] * b[i];
-      na += a[i] * a[i];
-      nb += b[i] * b[i];
-    }
-    if (na == 0 || nb == 0) return 0;
-    return dot / (sqrt(na) * sqrt(nb));
   }
 }

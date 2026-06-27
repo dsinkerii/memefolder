@@ -37,6 +37,7 @@ final List<({String tag, Color color, String label})> _allTags = [
   (tag: '@has:audio', color: Color(0xFFF36E36), label: 'modality'),
   (tag: '@has:speech', color: Color(0xFFF36E36), label: 'modality'),
   (tag: '@has:text', color: Color(0xFFF36E36), label: 'modality'),
+  (tag: '@has:motion', color: Color(0xFFF36E36), label: 'modality'),
 
   // folder: placeholder entries - real ones injected dynamically from workdir
   (tag: '@folder:', color: Color(0xFF4EB8A0), label: 'folder'),
@@ -440,7 +441,7 @@ List<Token> tokenize(String text) {
   List<Token> tokens = [];
   final regexTokens = RegExp(
     r'(\\@)' // 1. escaped @
-    r'|(@has:(?:audio|speech|text))' // 2. modality
+    r'|(@has:(?:audio|speech|text|motion))' // 2. modality
     r'|(\(|\))' // 3. brackets
     r'|(!)' // 4. not
     r'|(&)' // 5. and
@@ -448,7 +449,7 @@ List<Token> tokenize(String text) {
     r'|(@\.[a-zA-Z0-9]{2,4}(?=\s|$|[&|!()]))' // 7. extension
     r'|(@(?:audiocontent|imagecontent))' // 7b. content mode toggles
     r'|(@(?:video|gif|picture|image|photo|audio|sound))' // 8. filetype
-    r'|(@date[><=:][^\s@&|!()]+)' // 9. date logical
+    r'|(@date(?:[<>=]=?)[^\s@&|!()]+)' // 9. date logical
     r'|(@date\?[0-9]{4}(?:[\d.]*))' // 9b. date format: @date?YYYY, @date?MM.YYYY, @date?DD.MM.YYYY
     r'|(@(?:size|length|duration|width|height|fps|score)(?:[<>=]=?)[^\s@&|!()]+)' // 10. other logical
     r'|(@folder:[^\s@&|!()]*)' // 11. folder

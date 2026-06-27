@@ -1,7 +1,7 @@
 import 'dart:io';
 
-/// Writes checkpoint logs directly to stderr for live console output.
-/// No file I/O — no permission issues, no missing directories.
+/// writes checkpoint logs directly to stderr for live console output.
+/// no file I/O - no permission issues, no missing directories.
 class CrashLogger {
   static final CrashLogger instance = CrashLogger._();
   CrashLogger._();
