@@ -31,17 +31,6 @@ ever found yourself in that one position of not knowing where your meme is, some
 
 any 2-4 letter extension works
 
-### folder filter
-`@folder:path/to/subfolder` - limits to files under that relative path.
-
-### semantic content mode
-| Tag | Effect |
-|-----|--------|
-| `@imagecontent` | force CLIP (image+video) embedding search |
-| `@audiocontent` | force CLAP (audio+video) embedding search |
-
-default: CLIP if neither specified.
-
 ### score filter (post-filters semantic results)
 `@score>50` `@score<50` `@score=50` `@score>=50` `@score<=50`
 
@@ -50,9 +39,7 @@ filters by similarity score (0-100). only works when semantic search text is pre
 ### boolean operators
 `&` = AND, `|` = OR, `!` = NOT, `(` `)` = grouping
 
-### reserved (highlighting only, no filtering yet)
-`@date>YYYY` `@size>10mb` `@length>5s` `@duration>5s` `@width>1920` `@height>1080` `@fps>30`
-`@has:audio` `@has:speech` `@has:text`
+(more in [wiki](https://github.com/dsinkerii/memefolder/wiki/tags))
 
 ### example
 ```
