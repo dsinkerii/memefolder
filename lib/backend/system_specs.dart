@@ -37,7 +37,7 @@ class SystemSpecs {
     return 'CPU';
   }
 
-  String get tierRecommendation => isHighEnd ? 'high' : 'low';
+  String get tierRecommendation => isHighEnd ? 'full' : 'lite';
 
   static Future<SystemSpecs> detect() async {
     if (Platform.isLinux) return _detectLinux();

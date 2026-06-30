@@ -1,5 +1,6 @@
 #include "mel_ffi.h"
 #include "mel_filterbank.h"
+#include "whisper_filterbank.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -138,7 +139,7 @@ static void fft_radix2(float* re, float* im, int n) {
  * ================================================================ */
 static void hann_window(float* win, int n) {
     for (int i = 0; i < n; i++) {
-        win[i] = 0.5f * (1.0f - cosf(2.0f * 3.141592653589793f * i / (n - 1)));
+        win[i] = 0.5f * (1.0f - cosf(2.0f * 3.141592653589793f * i / n));
     }
 }
 
@@ -157,13 +158,15 @@ MEL_FFI_EXPORT void mel_init(void) {
  * CLAP log-mel spectrogram — internal implementation
  * ================================================================ */
 static void compute_clap_mel_impl(const float* pcm, int num_samples, float* output) {
-    float waveform[CLAP_MAX_SAMPLES + CLAP_N_FFT]; /* for center-padded */
+    float* waveform = (float*)malloc((CLAP_MAX_SAMPLES + CLAP_N_FFT) * sizeof(float));
     float window[CLAP_N_FFT];
     int i, f, t;
     float re[CLAP_N_FFT], im[CLAP_N_FFT];
     float power_spectrum[CLAP_N_FFT / 2 + 1];
     const int n_freq_bins = CLAP_N_FFT / 2 + 1; /* 513 */
     const int n_frames = CLAP_N_FRAMES; /* 1001 */
+
+    if (!waveform) return;
 
     /* "repeatpad": repeat audio to fill max_length, then zero-pad remainder */
     int ns = num_samples;
@@ -236,6 +239,7 @@ static void compute_clap_mel_impl(const float* pcm, int num_samples, float* outp
             output[t * CLAP_N_MELS + f] = 10.0f * log10f((float)val);
         }
     }
+    free(waveform);
 }
 
 /* ================================================================
@@ -254,6 +258,100 @@ MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* o
     }
 #else
     compute_clap_mel_impl(pcm, num_samples, output);
+#endif
+}
+
+/* ================================================================
+ * Whisper log-mel spectrogram — internal implementation
+ * Uses reflection padding at audio boundaries.
+ * ================================================================ */
+static void compute_whisper_mel_impl(const float* pcm, int num_samples, float* output) {
+    float* audio = (float*)malloc(WHISPER_MAX_SAMPLES * sizeof(float));
+    float window[WHISPER_N_FFT];
+    int i, t, f;
+    float re[WHISPER_N_FFT], im[WHISPER_N_FFT];
+    float power_spectrum[WHISPER_N_FREQ_BINS];
+    const int ns = WHISPER_MAX_SAMPLES;
+
+    if (!audio) return;
+
+    /* Copy input to local buffer, truncate or zero-pad to 30s */
+    int copy_len = num_samples;
+    if (copy_len > WHISPER_MAX_SAMPLES) copy_len = WHISPER_MAX_SAMPLES;
+    if (copy_len < 0) copy_len = 0;
+    for (i = 0; i < copy_len; i++) audio[i] = pcm[i];
+    for (i = copy_len; i < WHISPER_MAX_SAMPLES; i++) audio[i] = 0.0f;
+
+    /* Hann window */
+    hann_window(window, WHISPER_N_FFT);
+
+    /* Generate 3000 mel frames: [frame][mel_band] row-major */
+    for (t = 0; t < WHISPER_N_FRAMES; t++) {
+        int center = t * WHISPER_HOP_LENGTH;
+        int start  = center - WHISPER_N_FFT / 2;
+
+        /* Extract frame with reflection padding at boundaries */
+        for (i = 0; i < WHISPER_N_FFT; i++) {
+            int idx = start + i;
+            float sample;
+            if (idx < 0) {
+                sample = audio[-idx - 1];             /* reflect left */
+            } else if (idx >= ns) {
+                sample = audio[2 * ns - 1 - idx];      /* reflect right */
+            } else {
+                sample = audio[idx];
+            }
+            re[i] = sample * window[i];
+            im[i] = 0.0f;
+        }
+
+        /* DFT for non-power-of-2 N_FFT=400 */
+        for (f = 0; f < WHISPER_N_FREQ_BINS; f++) {
+            double sum_re = 0.0, sum_im = 0.0;
+            double angle = -2.0 * 3.141592653589793 * f / WHISPER_N_FFT;
+            for (i = 0; i < WHISPER_N_FFT; i++) {
+                double a = angle * i;
+                double c = cos(a), s = sin(a);
+                sum_re += re[i] * c - im[i] * s;
+                sum_im += re[i] * s + im[i] * c;
+            }
+            power_spectrum[f] = (float)(sum_re * sum_re + sum_im * sum_im);
+        }
+
+        /* Apply mel filterbank -> log magnitude */
+        for (f = 0; f < WHISPER_N_MELS; f++) {
+            double val = 0.0;
+            for (i = 0; i < WHISPER_N_FREQ_BINS; i++) {
+                val += WHISPER_MEL_FILTERBANK[f][i] * power_spectrum[i];
+            }
+            if (val < 1e-10) val = 1e-10;
+            output[t * WHISPER_N_MELS + f] = log10f((float)val);
+        }
+    }
+
+    /* Whisper normalization: clamp dynamic range, then shift/scale */
+    float max_val = -1e30f;
+    for (i = 0; i < WHISPER_N_FRAMES * WHISPER_N_MELS; i++) {
+        if (output[i] > max_val) max_val = output[i];
+    }
+    for (i = 0; i < WHISPER_N_FRAMES * WHISPER_N_MELS; i++) {
+        if (output[i] < max_val - 8.0f) output[i] = max_val - 8.0f;
+        output[i] = (output[i] + 4.0f) / 4.0f;
+    }
+
+    free(audio);
+}
+MEL_FFI_EXPORT void compute_whisper_mel(const float* pcm, int num_samples, float* output) {
+#ifdef _WIN32
+    __try {
+        compute_whisper_mel_impl(pcm, num_samples, output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        for (int i = 0; i < WHISPER_N_FRAMES * WHISPER_N_MELS; i++) {
+            output[i] = 0.0f;
+        }
+    }
+#else
+    compute_whisper_mel_impl(pcm, num_samples, output);
 #endif
 }
 

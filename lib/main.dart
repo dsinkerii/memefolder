@@ -5,7 +5,6 @@ import 'package:file_manager/controller/file_manager_controller.dart';
 import 'package:file_manager/file_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:memefolder/backend/custom_tags_store.dart';
-import 'package:memefolder/backend/embedding_service.dart';
 import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/filtering/filtering.dart';
 import 'package:memefolder/main_drawer.dart';
@@ -44,12 +43,6 @@ void main() async {
   } catch (_) {}
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
-  try {
-    await EmbeddingService.instance.initialize();
-    debugPrint('[main] EmbeddingService initialized');
-  } catch (e) {
-    debugPrint('[main] EmbeddingService init failed (models not found?): $e');
-  }
   runApp(
     ChangeNotifierProvider(
       create: (_) {

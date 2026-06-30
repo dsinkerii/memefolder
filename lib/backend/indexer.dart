@@ -13,7 +13,9 @@ import 'package:memefolder/utils/binary_paths.dart';
 import 'package:memefolder/widgets/bubble_snackbar.dart';
 import 'package:path/path.dart' as p;
 
+import 'caption_service.dart';
 import 'embedding_service.dart';
+import 'mel_ffi.dart';
 import 'tokenizer.dart';
 
 final _player = AudioPlayer();
@@ -160,13 +162,27 @@ Future<void> _cleanupTmp(String tmpPath) async {
 Future<void> _initDB(String currentPath, {required String dbPath}) async {
   final db = await openDatabase(
     dbPath,
-    version: 1,
+    version: 2,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON;');
       await db.execute('PRAGMA journal_mode = WAL;');
     },
     onCreate: (db, version) async {
       await _createSchema(db, currentPath);
+    },
+    onUpgrade: (db, oldVersion, newVersion) async {
+      if (oldVersion < 2) {
+        // dedup files with same rel_path, keep lowest id, then add unique index
+        await db.execute('''
+          DELETE FROM files WHERE id NOT IN (
+            SELECT MIN(id) FROM files GROUP BY rel_path
+          )
+        ''');
+        await db.execute('''
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_files_rel_path_unique
+          ON files(rel_path)
+        ''');
+      }
     },
   );
 
@@ -310,12 +326,18 @@ Future<Map<String, String?>> _extractAudioMetadata(String filePath) async {
 Future<Map<String, Object?>> _extractVideoInfo(String filePath) async {
   try {
     final result = await Process.run(ffprobePath, [
-      '-v', 'error',
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height,r_frame_rate,codec_type',
-      '-select_streams', 'a:0',
-      '-show_entries', 'stream=codec_type',
-      '-of', 'json',
+      '-v',
+      'error',
+      '-select_streams',
+      'v:0',
+      '-show_entries',
+      'stream=width,height,r_frame_rate,codec_type',
+      '-select_streams',
+      'a:0',
+      '-show_entries',
+      'stream=codec_type',
+      '-of',
+      'json',
       filePath,
     ]);
     if (result.exitCode != 0) return {};
@@ -748,6 +770,11 @@ Future<IndexResult> _scanAndIndex(
     }
   }
 
+  // free caption models (not needed for search)
+  try {
+    await CaptionService.instance.unload();
+  } catch (_) {}
+
   await _congratulateScanEnd();
 
   return IndexResult(
@@ -761,12 +788,10 @@ Future<IndexResult> _scanAndIndex(
 Future<void> _autoInitEmbedding() async {
   try {
     final modelsPath = await EmbeddingService.resolveModelsPath();
-    final tier = PlayerPrefs.getString('model_tier', 'low');
-    final clipDim = EmbeddingService.clipDimForTier(tier);
+    final tier = PlayerPrefs.getString('model_tier', 'lite');
     await EmbeddingService.instance.initialize(
       modelsPath: modelsPath,
       tier: tier,
-      clipDim: clipDim,
     );
   } catch (e) {
     debugPrint('[indexer] auto-init embedding failed: $e');
@@ -806,7 +831,7 @@ Future<void> _createSchema(Database db, String currentPath) async {
       root_name TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       indexed_at INTEGER,
-      model_tier TEXT NOT NULL DEFAULT 'low',
+      model_tier TEXT NOT NULL DEFAULT 'lite',
       model_name TEXT NOT NULL DEFAULT 'clip-vit-b32',
       text_model TEXT,
       app_version TEXT,
@@ -860,7 +885,9 @@ Future<void> _createSchema(Database db, String currentPath) async {
       clip_emb BLOB,
       clap_emb BLOB,
       metadata_emb BLOB,
-      metadata_text TEXT
+      metadata_text TEXT,
+      ocr_emb BLOB,
+      transcript_emb BLOB
     );
   ''');
 
@@ -948,7 +975,9 @@ Future<void> _createSchema(Database db, String currentPath) async {
     CREATE INDEX IF NOT EXISTS idx_tags_slug ON tags(slug);
   ''');
 
-  final currentTier = PlayerPrefs.getString('model_tier', 'low');
+  var currentTier = PlayerPrefs.getString('model_tier', 'lite');
+  if (currentTier == 'low') currentTier = 'lite';
+  if (currentTier == 'high') currentTier = 'full';
   await db.insert('roots', {
     'id': 1,
     'root_path': currentPath,
@@ -956,7 +985,7 @@ Future<void> _createSchema(Database db, String currentPath) async {
     'created_at': now,
     'indexed_at': null,
     'model_tier': currentTier,
-    'model_name': currentTier == 'high' ? 'clip-vit-l14' : 'clip-vit-b32',
+    'model_name': 'siglip2-$currentTier',
     'app_version': null,
     'schema_version': 2,
   });
@@ -1070,6 +1099,36 @@ Future<List<String>> getFileTags(String rootPath, String absPath) async {
   } catch (e) {
     debugPrint('[tags] getFileTags error: $e');
     return [];
+  }
+}
+
+Future<Map<String, dynamic>> getFileEmbeddingInfo(
+  String rootPath,
+  String absPath,
+) async {
+  final dbPath = p.join(rootPath, '.memefolder.db');
+  if (!File(dbPath).existsSync()) return {};
+
+  try {
+    final db = await openDatabase(dbPath, singleInstance: false);
+    final rows = await db.rawQuery(
+      '''
+      SELECT f.clip_emb, f.clap_emb, f.metadata_emb, f.ocr_emb,
+             f.transcript_emb,
+             ft.ocr_text, ft.transcript_text
+      FROM files f
+      LEFT JOIN file_text ft ON ft.file_id = f.id
+      WHERE f.rel_path = ?
+      LIMIT 1
+    ''',
+      [p.relative(absPath, from: rootPath)],
+    );
+    await db.close();
+    if (rows.isEmpty) return {};
+    return rows.first;
+  } catch (e) {
+    debugPrint('[embeddings] getFileEmbeddingInfo error: $e');
+    return {};
   }
 }
 
@@ -1221,6 +1280,29 @@ Future<(int, int)> _processEmbedQueue(
   final tokenizer = HuggingFaceTokenizer.fromFile(
     p.join(svc.modelsPath!, 'clip', 'tokenizer.json'),
   );
+  var currentTier = PlayerPrefs.getString('model_tier', 'lite');
+  if (currentTier == 'low') currentTier = 'lite';
+  if (currentTier == 'high') currentTier = 'full';
+  final isMidOrFull = currentTier == 'mid' || currentTier == 'full';
+  // initialize caption service for mid/full tiers
+  if (isMidOrFull && !CaptionService.instance.isInitialized) {
+    try {
+      await CaptionService.instance.initialize(
+        modelsPath: svc.modelsPath!,
+        gpuProvider: 'CPU',
+      );
+      stderr.writeln(
+        '[memefolder] caption service initialized (CPU) modelsPath=${svc.modelsPath}',
+      );
+    } catch (e) {
+      stderr.writeln('[memefolder] caption service init failed: $e');
+      debugPrint('[embed] caption service init failed: $e');
+    }
+  } else {
+    if (isMidOrFull) {
+      stderr.writeln('[memefolder] caption service already initialized');
+    }
+  }
   final db = await openDatabase(dbPath);
   var done = 0;
   var ok = 0;
@@ -1233,7 +1315,7 @@ Future<(int, int)> _processEmbedQueue(
         '[memefolder] embedJob: fileId=${job.fileId} type=${job.mediaType} path=${job.absPath}',
       );
       try {
-        await _embedOneFile(db, svc, tokenizer, job);
+        await _embedOneFile(db, svc, tokenizer, job, tier: currentTier);
         ok++;
       } catch (e) {
         fail++;
@@ -1263,8 +1345,11 @@ Future<void> _embedOneFile(
   Database db,
   EmbeddingService svc,
   HuggingFaceTokenizer tokenizer,
-  _EmbedJob job,
-) async {
+  _EmbedJob job, {
+  String tier = 'lite',
+}) async {
+  final isMidOrFull = tier == 'mid' || tier == 'full';
+  final isFull = tier == 'full';
   final updates = <String, Object?>{};
   final crashLog = CrashLogger.instance;
 
@@ -1277,13 +1362,15 @@ Future<void> _embedOneFile(
     debugPrint('[embed] clip embedding failed for ${job.absPath}: $e');
   }
 
-  try {
-    final clapEmb = await _embedClapForFile(svc, job);
-    if (clapEmb != null && clapEmb.length == svc.clapDim) {
-      updates['clap_emb'] = clapEmb.buffer.asUint8List();
+  if (isFull) {
+    try {
+      final clapEmb = await _embedClapForFile(svc, job);
+      if (clapEmb != null && clapEmb.length == svc.clapDim) {
+        updates['clap_emb'] = clapEmb.buffer.asUint8List();
+      }
+    } catch (e) {
+      debugPrint('[embed] clap embedding failed for ${job.absPath}: $e');
     }
-  } catch (e) {
-    debugPrint('[embed] clap embedding failed for ${job.absPath}: $e');
   }
 
   try {
@@ -1303,6 +1390,92 @@ Future<void> _embedOneFile(
     }
   } catch (e) {
     debugPrint('[embed] metadata embedding failed for ${job.absPath}: $e');
+  }
+
+  // ocr for images and video keyframes (mid/full)
+  final captionReady = CaptionService.instance.isInitialized;
+  String? ocrText;
+  if (isMidOrFull &&
+      captionReady &&
+      (job.mediaType == 'image' || job.mediaType == 'video')) {
+    try {
+      Uint8List? imageBytes;
+      if (job.mediaType == 'image') {
+        imageBytes = await File(job.absPath).readAsBytes();
+      } else {
+        // extract first frame from video
+        final keyframePath = '${job.absPath}.ocr_keyframe.jpg';
+        final result = await Process.run(ffmpegPath, [
+          '-y',
+          '-i',
+          job.absPath,
+          '-vframes',
+          '1',
+          '-f',
+          'image2',
+          keyframePath,
+        ]);
+        if (result.exitCode == 0) {
+          final kf = File(keyframePath);
+          if (await kf.exists() && await kf.length() > 0) {
+            imageBytes = await kf.readAsBytes();
+          }
+          try {
+            await kf.delete();
+          } catch (_) {}
+        }
+      }
+      if (imageBytes != null) {
+        stderr.writeln('[caption] OCR: start file=${job.absPath}');
+        ocrText = await CaptionService.instance.runOcr(imageBytes);
+        stderr.writeln('[caption] OCR: done len=${ocrText.length}');
+      }
+    } catch (e) {
+      stderr.writeln('[caption] OCR failed for ${job.absPath}: $e');
+    }
+  }
+
+  // whisper transcription for audio/video (mid/full)
+  String? transcript;
+  if (isMidOrFull &&
+      captionReady &&
+      (job.mediaType == 'audio' || job.mediaType == 'video')) {
+    try {
+      stderr.writeln(
+        '[caption] Whisper: start extractAudio file=${job.absPath}',
+      );
+      final pcm = await _extractAudio16kHz(
+        job.absPath,
+        job.mediaType == 'video',
+      );
+      if (pcm != null) {
+        stderr.writeln(
+          '[caption] Whisper: start runWhisper pcmLen=${pcm.length}',
+        );
+        transcript = await CaptionService.instance.runWhisper(pcm);
+        stderr.writeln('[caption] Whisper: done len=${transcript.length}');
+      } else {
+        stderr.writeln('[caption] Whisper: extractAudio returned null');
+      }
+    } catch (e) {
+      stderr.writeln('[caption] Whisper failed for ${job.absPath}: $e');
+    }
+  }
+
+  // store ocr/transcript text and their clip text embeddings
+  if (ocrText != null && ocrText.isNotEmpty) {
+    _upsertFileText(db, job.fileId, ocrText: ocrText);
+    final tokenIds = tokenizer.encodeClip(ocrText);
+    final emb = await svc.embedClipText(tokenIds);
+    updates['ocr_emb'] = emb.buffer.asUint8List();
+    updates['has_text'] = 1;
+  }
+  if (transcript != null && transcript.isNotEmpty) {
+    _upsertFileText(db, job.fileId, transcript: transcript);
+    final tokenIds = tokenizer.encodeClip(transcript);
+    final emb = await svc.embedClipText(tokenIds);
+    updates['transcript_emb'] = emb.buffer.asUint8List();
+    updates['has_speech'] = 1;
   }
 
   crashLog.mark('embedOneFile:save', {'updateKeys': updates.keys.join(',')});
@@ -1445,6 +1618,49 @@ Future<Float32List?> _embedClapForFile(
   }
 }
 
+/// Extract 16kHz mono PCM from audio/video file via ffmpeg.
+/// Returns null on failure. Max 30s (480000 samples).
+Future<Float32List?> _extractAudio16kHz(String absPath, bool isVideo) async {
+  final pcmPath = '$absPath.whisper.pcm';
+  try {
+    final args = <String>[
+      '-y',
+      '-i',
+      absPath,
+      '-acodec',
+      'pcm_s16le',
+      '-ar',
+      '16000',
+      '-ac',
+      '1',
+      '-f',
+      's16le',
+    ];
+    if (isVideo) args.insertAll(1, ['-vn']);
+    args.add(pcmPath);
+    stderr.writeln('[caption] ffmpeg audio: start path=$absPath');
+    final result = await Process.run(ffmpegPath, args);
+    stderr.writeln('[caption] ffmpeg audio: exitCode=${result.exitCode}');
+    if (result.exitCode != 0) return null;
+    final pcmFile = File(pcmPath);
+    if (!await pcmFile.exists()) return null;
+    final pcmLen = await pcmFile.length();
+    stderr.writeln('[caption] ffmpeg audio: pcmLen=$pcmLen');
+    if (pcmLen == 0 || pcmLen > MelFFI.whisperMaxSamples * 2) return null;
+    final pcmBytes = await pcmFile.readAsBytes();
+    final samples = Int16List.view(pcmBytes.buffer);
+    final floatPcm = Float32List(samples.length);
+    for (int i = 0; i < samples.length; i++) {
+      floatPcm[i] = samples[i] / 32768.0;
+    }
+    return floatPcm;
+  } finally {
+    try {
+      await File(pcmPath).delete();
+    } catch (_) {}
+  }
+}
+
 /// Build metadata text and embed via CLIP text encoder.
 /// Returns (embedding, metadata_text) or null.
 Future<(Float32List, String)?> _embedMetadata(
@@ -1499,4 +1715,37 @@ Future<(Float32List, String)?> _embedMetadata(
   final tokenIds = tokenizer.encodeClip(metadataText);
   final emb = await svc.embedClipText(tokenIds);
   return (emb, metadataText);
+}
+
+/// upsert a single column in file_text without clobbering other columns.
+Future<void> _upsertFileText(
+  Database db,
+  int fileId, {
+  String? ocrText,
+  String? transcript,
+}) async {
+  if (ocrText == null && transcript == null) return;
+  final existing = await db.query(
+    'file_text',
+    columns: ['file_id'],
+    where: 'file_id = ?',
+    whereArgs: [fileId],
+  );
+  if (existing.isNotEmpty) {
+    final vals = <String, Object?>{};
+    if (ocrText != null) vals['ocr_text'] = ocrText;
+    if (transcript != null) vals['transcript_text'] = transcript;
+    await db.update(
+      'file_text',
+      vals,
+      where: 'file_id = ?',
+      whereArgs: [fileId],
+    );
+  } else {
+    await db.insert('file_text', {
+      'file_id': fileId,
+      if (ocrText != null) 'ocr_text': ocrText,
+      if (transcript != null) 'transcript_text': transcript,
+    });
+  }
 }

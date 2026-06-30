@@ -25,33 +25,60 @@ void showRuntimeManagerDialog(BuildContext context) {
   );
 }
 
-const _manifestFiles = [
-  'clip/vision_model.onnx',
-  'clip/text_model.onnx',
-  'clip/tokenizer.json',
-  'clap/audio_model_quantized.onnx',
-  'clap/text_model_quantized.onnx',
-  'clap/tokenizer.json',
-];
+List<String> manifestFilesForTier(String tier) {
+  final siglip = [
+    'clip/vision_model.onnx',
+    'clip/text_model.onnx',
+    'clip/tokenizer.json',
+  ];
+  final cap = [
+    'ocr/recognition.onnx',
+    'ocr/vocab.txt',
+    'whisper/tiny_encoder.onnx',
+    'whisper/tiny_decoder.onnx',
+    'whisper/tokenizer.json',
+  ];
+  final clap = [
+    'clap/audio_model_fp16.onnx',
+    'clap/text_model_quantized.onnx',
+    'clap/tokenizer.json',
+  ];
+  switch (tier) {
+    case 'lite':
+      return [...siglip];
+    case 'mid':
+      return [...siglip, ...cap];
+    case 'full':
+      return [...siglip, ...clap, ...cap];
+    default:
+      return [];
+  }
+}
 
 const tierMeta = {
-  'low': {
-    'label': 'Low',
-    'desc': 'CLIP ViT-B/32 + CLAP',
-    'clip': '512d',
+  'lite': {
+    'label': 'Lite',
+    'desc': 'SigLIP vision + text (768d)',
+    'clip': '768d',
     'vram': '1.2 GB',
     'ram': '600 MB',
-    'remoteUrl':
-        'https://github.com/dsinkerii/memefolder/releases/download/1.0/low.zip',
+    'remoteUrl': '',
   },
-  'high': {
-    'label': 'High',
-    'desc': 'CLIP ViT-L/14 + CLAP',
+  'mid': {
+    'label': 'Mid',
+    'desc': 'SigLIP + OCR + Whisper Tiny',
+    'clip': '768d',
+    'vram': '1.9 GB',
+    'ram': '900 MB',
+    'remoteUrl': '',
+  },
+  'full': {
+    'label': 'Full',
+    'desc': 'SigLIP + CLAP + OCR + Whisper Tiny',
     'clip': '768d',
     'vram': '2.8 GB',
-    'ram': '1.2 GB',
-    'remoteUrl':
-        'https://github.com/dsinkerii/memefolder/releases/download/1.0/high.zip',
+    'ram': '1.4 GB',
+    'remoteUrl': '',
   },
 };
 
@@ -68,7 +95,7 @@ class _RuntimeManagerDialog extends StatefulWidget {
 class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   SystemSpecs? _specs;
   bool _loadingSpecs = true;
-  String _tier = 'low';
+  String _tier = 'lite';
   String _basePath = '';
   bool _loadingModels = true;
   bool _busy = false;
@@ -88,7 +115,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     setState(() {
       _specs = specs;
       _loadingSpecs = false;
-      _tier = saved.isNotEmpty ? saved : specs.tierRecommendation;
+      if (saved == 'low') {
+        _tier = 'lite';
+      } else if (saved == 'high') {
+        _tier = 'full';
+      } else {
+        _tier = saved.isNotEmpty ? saved : specs.tierRecommendation;
+      }
     });
     _basePath = await _modelsDir();
     if (mounted) setState(() => _loadingModels = false);
@@ -122,6 +155,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
 
   bool _hasModel(String file) =>
       File(p.join(_basePath, _tier, file)).existsSync();
+  List<String> get _manifestFiles => manifestFilesForTier(_tier);
   bool get _hasAllModels => _manifestFiles.every(_hasModel);
 
   int get _modelCount => _manifestFiles.where((f) => _hasModel(f)).length;
@@ -218,7 +252,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
       final firstParts = firstFile.name.split('/');
       final stripTop =
           firstParts.length > 2 &&
-          ['clip', 'clap', 'manifest.yaml'].contains(firstParts[1]);
+          [
+            'clip',
+            'clap',
+            'ocr',
+            'whisper',
+            'manifest.yaml',
+          ].contains(firstParts[1]);
 
       for (final entry in archive) {
         if (entry.isFile) {
@@ -270,14 +310,11 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
       _statusMsg = 'Loading...';
     });
     try {
-      final meta = tierMeta[_tier]!;
-      final clipDim = meta['clip'] == '512d' ? 512 : 768;
       final gpuProvider = _specs?.recommendedGpuProvider;
       await EmbeddingService.instance.initialize(
         modelsPath: _basePath,
-        tier: _tier,
         gpuProvider: gpuProvider,
-        clipDim: clipDim,
+        tier: _tier,
       );
       if (mounted) {
         final gpuErr = EmbeddingService.instance.gpuInitError;
@@ -494,10 +531,11 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
 
   Widget _buildTierCards(ColorScheme cs) {
     return Row(
-      children: ['low', 'high'].map((t) {
+      children: ['lite', 'mid', 'full'].map((t) {
         final sel = _tier == t;
         final meta = tierMeta[t]!;
-        final cnt = _manifestFiles
+        final files = manifestFilesForTier(t);
+        final cnt = files
             .where((f) => File(p.join(_basePath, t, f)).existsSync())
             .length;
         return Expanded(
@@ -505,7 +543,13 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             onTap: () => _setTier(t),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
-              margin: EdgeInsets.only(right: t == 'low' ? 6 : 0),
+              margin: EdgeInsets.only(
+                right: t == 'lite'
+                    ? 6
+                    : t == 'mid'
+                    ? 6
+                    : 0,
+              ),
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: sel
@@ -539,7 +583,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
                         ),
                       ),
                       const Spacer(),
-                      _statusIcon(cnt, cs),
+                      _statusIcon(cnt, files.length, cs),
                     ],
                   ),
                   const SizedBox(height: 4),
@@ -564,8 +608,8 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     );
   }
 
-  Widget _statusIcon(int count, ColorScheme cs) {
-    if (count == _manifestFiles.length) {
+  Widget _statusIcon(int count, int total, ColorScheme cs) {
+    if (count == total) {
       return Icon(Icons.check_circle, size: 14, color: cs.primary);
     }
     if (count > 0) return Icon(Icons.warning, size: 14, color: Colors.orange);

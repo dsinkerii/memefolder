@@ -15,6 +15,7 @@ class HuggingFaceTokenizer {
   final Map<String, List<int>> _bpeCache = {};
   final Map<int, String> _bytesToUnicode = {};
   final Map<String, int> _unicodeToBytes = {};
+  final bool _isSiglip;
 
   HuggingFaceTokenizer._({
     required this.vocab,
@@ -25,7 +26,8 @@ class HuggingFaceTokenizer {
     this.endOfWordSuffix,
     this.doLowercase = false,
     this.isByteLevel = true,
-  }) {
+    bool isSiglip = false,
+  }) : _isSiglip = isSiglip {
     _initByteEncoding();
   }
 
@@ -33,7 +35,8 @@ class HuggingFaceTokenizer {
     final json = jsonDecode(File(path).readAsStringSync()) as Map<String, dynamic>;
     final model = json['model'] as Map<String, dynamic>;
     final rawVocab = model['vocab'] as Map<String, dynamic>;
-    final rawMerges = (model['merges'] as List<dynamic>).cast<String>();
+    final rawMerges = model['merges'] as List<dynamic>;
+    final isListMerges = rawMerges.isNotEmpty && rawMerges[0] is List;
 
     final vocab = rawVocab.map((k, v) => MapEntry(k, (v as num).toInt()));
     final revVocab = vocab.map((k, v) => MapEntry(v, k));
@@ -44,7 +47,9 @@ class HuggingFaceTokenizer {
     // merges are ordered by priority (lower index = higher priority)
     final mergeMap = <int, Map<int, (int, int)>>{};
     for (int rank = 0; rank < rawMerges.length; rank++) {
-      final parts = rawMerges[rank].split(' ');
+      final parts = isListMerges
+          ? (rawMerges[rank] as List<dynamic>).cast<String>()
+          : (rawMerges[rank] as String).split(' ');
       final left = parts[0];
       final right = parts[1];
       final leftId = vocab[left];
@@ -69,12 +74,31 @@ class HuggingFaceTokenizer {
     }
 
     List<int>? startId, endId;
+    bool isSiglip = false;
     final pp = json['post_processor'] as Map<String, dynamic>?;
     if (pp != null && pp['type'] == 'RobertaProcessing') {
       final cls = pp['cls'] as List;
       final sep = pp['sep'] as List;
       if (cls.length >= 2) startId = [(cls[1] as num).toInt()];
       if (sep.length >= 2) endId = [(sep[1] as num).toInt()];
+    } else if (pp != null && pp['type'] == 'TemplateProcessing' &&
+               json['pre_tokenizer']?['type'] == 'Split') {
+      isSiglip = true;
+      final special = pp['special_tokens'] as Map<String, dynamic>?;
+      if (special != null) {
+        for (final entry in special.entries) {
+          final tokenName = entry.value['id'] as String?;
+          final ids = entry.value['ids'] as List?;
+          if (tokenName != null && ids != null && ids.isNotEmpty) {
+            if (tokenName == '<eos>') {
+              endId = [(ids[0] as num).toInt()];
+            }
+            if (tokenName == '<bos>') {
+              startId = [(ids[0] as num).toInt()];
+            }
+          }
+        }
+      }
     }
     if (startId == null && vocab.containsKey('<|startoftext|>')) {
       startId = [vocab['<|startoftext|>']!];
@@ -94,6 +118,7 @@ class HuggingFaceTokenizer {
       endOfWordSuffix: (eowSuffix != null && eowSuffix.isNotEmpty) ? eowSuffix : null,
       doLowercase: doLower,
       isByteLevel: hasSequencePreTokenizer,
+      isSiglip: isSiglip,
     );
   }
 
@@ -219,6 +244,35 @@ class HuggingFaceTokenizer {
 
   /// Encode text to token IDs.
   List<int> encode(String text, {int? maxLength, bool addSpecialTokens = true}) {
+    if (_isSiglip) {
+      // SigLIP/Gemma tokenizer: replace spaces with ▁, single-word BPE
+      String normalized = text.replaceAll(' ', '\u2581');
+      if (normalized.isEmpty) normalized = '\u2581';
+      final ids = <int>[];
+
+      if (addSpecialTokens && startTokenId != null) {
+        ids.addAll(startTokenId!);
+      }
+
+      final wordIds = _wordToIds(normalized);
+      ids.addAll(_bpe(wordIds));
+
+      if (addSpecialTokens && endTokenId != null) {
+        ids.addAll(endTokenId!);
+      }
+
+      if (maxLength != null && ids.length > maxLength) {
+        if (startTokenId != null && endTokenId != null &&
+            startTokenId!.length + endTokenId!.length < maxLength) {
+          final keep = maxLength - startTokenId!.length - endTokenId!.length;
+          return [...startTokenId!, ...ids.skip(startTokenId!.length).take(keep), ...endTokenId!];
+        }
+        return ids.sublist(0, maxLength);
+      }
+
+      return ids;
+    }
+
     text = _normalize(text);
     final ids = <int>[];
 
@@ -266,7 +320,12 @@ class HuggingFaceTokenizer {
     return ids;
   }
 
+  bool get isSiglip => _isSiglip;
+
   Int64List encodeClip(String text) {
+    if (_isSiglip) {
+      return encodeSiglip(text);
+    }
     final ids = encode(text, addSpecialTokens: true, maxLength: 77);
     final padded = Int64List(77);
     final padId = vocab['<|endoftext|>'] ?? 0;
@@ -285,4 +344,81 @@ class HuggingFaceTokenizer {
     }
     return padded;
   }
+
+  Int64List encodeSiglip(String text) {
+    const maxLen = 64;
+    final ids = encode(text, addSpecialTokens: true, maxLength: maxLen);
+    final padded = Int64List(maxLen);
+    final padId = vocab['<pad>'] ?? 0;
+    for (int i = 0; i < maxLen; i++) {
+      padded[i] = i < ids.length ? ids[i] : padId;
+    }
+    return padded;
+  }
+
+  /// Decode token IDs back to text (reverse of encode).
+  String decode(List<int> ids, {bool skipSpecialTokens = true}) {
+    final parts = <String>[];
+    for (final id in ids) {
+      final token = revVocab[id];
+      if (token == null) continue;
+      if (skipSpecialTokens && _isSpecialToken(token)) continue;
+      parts.add(token);
+    }
+    final joined = parts.join();
+    if (_isSiglip) {
+      return joined.replaceAll('\u2581', ' ');
+    }
+    return _decodeBytes(joined);
+  }
+
+  bool _isSpecialToken(String token) {
+    return token.startsWith('<|') && token.endsWith('|>');
+  }
+
+  /// Reverse byte encoding: unicode chars → bytes → UTF-8.
+  String _decodeBytes(String text) {
+    final bytes = <int>[];
+    for (int i = 0; i < text.length; i++) {
+      final c = text[i];
+      final byte = _unicodeToBytes[c];
+      bytes.add(byte ?? c.codeUnitAt(0));
+    }
+    return utf8.decode(bytes);
+  }
+}
+
+/// Whisper tokenizer helper wrapping HuggingFaceTokenizer.
+class WhisperTokenizer {
+  final HuggingFaceTokenizer _inner;
+  static const int sotId = 50258;
+  static const int enId = 50259;
+  static const int transcribeId = 50359;
+  static const int notimestampsId = 50363;
+  static const int eosId = 50257;
+
+  WhisperTokenizer._(this._inner);
+
+  factory WhisperTokenizer.fromFile(String path) {
+    return WhisperTokenizer._(HuggingFaceTokenizer.fromFile(path));
+  }
+
+  Map<String, int> get vocab => _inner.vocab;
+  Map<int, String> get revVocab => _inner.revVocab;
+
+  /// Build the initial decoder prompt tokens: SOT + lang + task + notimestamps.
+  List<int> promptTokens({int langId = enId, int taskId = transcribeId}) {
+    return [sotId, langId, taskId, notimestampsId];
+  }
+
+  /// Decode whisper output tokens, stripping special/timestamp tokens.
+  String decodeWhisper(List<int> ids) {
+    final textTokens = ids.where((t) => t >= 0 && t < eosId).toList();
+    return _inner.decode(textTokens, skipSpecialTokens: false);
+  }
+
+  Int64List encodeClip(String text) => _inner.encodeClip(text);
+  Int64List encodeClap(String text) => _inner.encodeClap(text);
+  List<int> encode(String text, {int? maxLength, bool addSpecialTokens = true}) =>
+      _inner.encode(text, maxLength: maxLength, addSpecialTokens: addSpecialTokens);
 }

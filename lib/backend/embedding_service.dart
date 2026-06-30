@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:ui' as ui;
+
 import 'package:flutter/foundation.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/utils/crash_logger.dart';
-
-import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'embedding_isolate.dart';
 import 'mel_ffi.dart';
 
 enum ModelType { clipVision, clipText, clapAudio, clapText }
@@ -21,15 +22,9 @@ class EmbeddingService {
   bool _initialized = false;
   bool get isInitialized => _initialized;
 
-  // Model sessions
-  OrtSession? _clipVision;
-  OrtSession? _clipText;
-  OrtSession? _clapAudio;
-  OrtSession? _clapText;
+  Isolate? _isolate;
+  SendPort? _isolateSendPort;
 
-  /// Embedding dimensions depend on model tier.
-  /// Low tier (ViT-B/32): CLIP=512, CLAP=512.
-  /// Mid/high tier (ViT-L/14): CLIP=768, CLAP=512.
   int clipDim = 512;
   int get clapDim => 512;
   String _gpuProvider = 'CPU';
@@ -37,26 +32,20 @@ class EmbeddingService {
   String? _gpuInitError;
   String? get gpuInitError => _gpuInitError;
 
-  // C FFI for audio preprocessing
-  MelFFI? _mel;
-
-  /// Path to directory containing model files
   String? _modelsPath;
   String? get modelsPath => _modelsPath;
   String? _modelsBasePath;
 
   Timer? _idleTimer;
-  int get _idleTimeoutMinutes =>
-      PlayerPrefs.getInt('model_idle_timeout', 10);
-  String? _lastTier;
+  int get _idleTimeoutMinutes => PlayerPrefs.getInt('model_idle_timeout', 10);
   String? _lastGpuProvider;
-  int? _lastClipDim;
 
+  // idle keepalive
   void _touchIdleTimer() {
     _idleTimer?.cancel();
     final minutes = _idleTimeoutMinutes;
     if (minutes <= 0) return;
-    _idleTimer = Timer(Duration(minutes: minutes), unload);
+    _idleTimer = Timer(Duration(minutes: minutes), () => unload());
   }
 
   void restartIdleTimer() => _touchIdleTimer();
@@ -66,22 +55,42 @@ class EmbeddingService {
     _idleTimer = null;
     if (!_initialized) return;
     debugPrint('[embedding] unloading models after idle timeout');
-    await _clapAudio?.release();
-    await _clapText?.release();
-    await _clipVision?.release();
-    await _clipText?.release();
-    _clapAudio = null;
-    _clapText = null;
-    _clipVision = null;
-    _clipText = null;
-    _mel = null;
+    if (_isolateSendPort != null) {
+      final rp = ReceivePort();
+      _isolateSendPort!.send([6, rp.sendPort]);
+      rp.close();
+    }
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _isolateSendPort = null;
     _initialized = false;
+  }
+
+  Future<SendPort> _spawnIsolate() async {
+    final receivePort = ReceivePort();
+    _isolate = await Isolate.spawn(embeddingIsolateMain, receivePort.sendPort);
+    final sendPort = await receivePort.first as SendPort;
+    _isolateSendPort = sendPort;
+    return sendPort;
+  }
+
+  Future<T> _sendToIsolate<T>(List<dynamic> msg) async {
+    if (_isolateSendPort == null) {
+      throw StateError('Isolate not initialized');
+    }
+    final rp = ReceivePort();
+    _isolateSendPort!.send([msg[0], rp.sendPort, ...msg.sublist(1)]);
+    final result = await rp.first;
+    rp.close();
+    final list = result as List;
+    final code = list[0] as int;
+    if (code == 1) throw Exception('${list[1]}');
+    return list.length > 1 ? list[1] as T : (null as T);
   }
 
   Future<void> initialize({
     String? modelsPath,
     String? gpuProvider,
-    int? clipDim,
     String? tier,
   }) async {
     if (_initialized) return;
@@ -90,141 +99,41 @@ class EmbeddingService {
     _modelsBasePath = base;
     _modelsPath = tier != null ? p.join(base, tier) : base;
     debugPrint('[embedding] models path: $_modelsPath');
-    if (clipDim != null) this.clipDim = clipDim;
-    _mel = MelFFI();
 
-    final options = OrtSessionOptions();
-    await options.appendDefaultProviders();
-    if (gpuProvider != null && gpuProvider != 'CPU') {
-      try {
-        switch (gpuProvider) {
-          case 'CUDA':
-            options.appendCudaProvider(CUDAFlags.useNone);
-            break;
-          case 'ROCm':
-            options.appendRocmProvider(ROCmFlags.useNone);
-            break;
-          case 'DirectML':
-            options.appendDirectMLProvider();
-            break;
-          case 'CoreML':
-            options.appendCoreMLProvider(CoreMLFlags.useNone);
-            break;
-          case 'OpenVINO':
-            options.appendOpenVINOProvider();
-            break;
-          case 'TensorRT':
-            options.appendTensorRTProvider();
-            break;
-        }
-        _gpuProvider = gpuProvider;
-      } catch (e) {
-        _gpuInitError = '$e';
-        debugPrint('[embedding] GPU provider $gpuProvider not available: $e');
-      }
-    }
-    options.setIntraOpNumThreads(4);
-    options.setSessionGraphOptimizationLevel(
-      GraphOptimizationLevel.ortEnableAll,
-    );
+    await _spawnIsolate();
+    final result = await _sendToIsolate<List>([0, _modelsPath, gpuProvider, tier]);
+    clipDim = result[0] as int;
+    _gpuInitError = result[1] as String?;
+    _gpuProvider = (_gpuInitError != null) ? 'CPU' : (gpuProvider ?? 'CPU');
 
-    // Load models (fromBuffer to avoid char/wchar_t path encoding on Windows)
-    try {
-      _clapAudio = OrtSession.fromBuffer(
-        await File(p.join(_modelsPath!, 'clap', 'audio_model_quantized.onnx'))
-            .readAsBytes(),
-        options,
-      );
-      _clapText = OrtSession.fromBuffer(
-        await File(p.join(_modelsPath!, 'clap', 'text_model_quantized.onnx'))
-            .readAsBytes(),
-        options,
-      );
-      _clipVision = OrtSession.fromBuffer(
-        await File(p.join(_modelsPath!, 'clip', 'vision_model.onnx'))
-            .readAsBytes(),
-        options,
-      );
-      _clipText = OrtSession.fromBuffer(
-        await File(p.join(_modelsPath!, 'clip', 'text_model.onnx'))
-            .readAsBytes(),
-        options,
-      );
-    } catch (e) {
-      final path = _modelsPath;
-      _modelsPath = null;
-      _modelsBasePath = null;
-      _initialized = false;
-      throw Exception(
-        'Failed to load models from $path: $e',
-      );
-    }
-
-    _lastTier = tier;
     _lastGpuProvider = gpuProvider;
-    _lastClipDim = clipDim;
     _initialized = true;
     _touchIdleTimer();
   }
 
-  /// Embed audio file → 512d CLAP embedding.
-  /// Requires 48kHz mono PCM data.
   Future<Float32List> embedAudio(Float32List pcm48kHz) async {
     await _ensureInitialized();
     _touchIdleTimer();
-
-    if (pcm48kHz.isEmpty) {
-      throw ArgumentError('PCM data is empty');
+    if (pcm48kHz.isEmpty) throw ArgumentError('PCM data is empty');
+    var pcm = pcm48kHz;
+    if (pcm.length > MelFFI.clapMaxSamples) {
+      pcm = Float32List.sublistView(pcm, 0, MelFFI.clapMaxSamples);
     }
-    if (pcm48kHz.length > MelFFI.clapMaxSamples) {
-      throw ArgumentError(
-        'PCM too long: ${pcm48kHz.length} samples (max ${MelFFI.clapMaxSamples})',
-      );
-    }
-    // Check for all-zeros which can cause NaN in mel filterbank
-    bool allZero = true;
-    for (int i = 0; i < pcm48kHz.length && i < 1000; i++) {
-      if (pcm48kHz[i] != 0.0) {
-        allZero = false;
-        break;
-      }
-    }
-    if (allZero) {
-      debugPrint('[embed] warning: PCM data is all zeros');
-    }
-
-    CrashLogger.instance.mark('embedAudio:computeClapMel', {
-      'pcmLen': pcm48kHz.length,
-      'allZero': allZero,
+    CrashLogger.instance.mark('embedAudio:isolate.send', {
+      'pcmLen': pcm.length,
     });
-    final mel = _mel!.computeClapMel(pcm48kHz);
-
-    CrashLogger.instance.mark('embedAudio:clapAudio.run', {
-      'melShape': '${mel.length} (1x1x${MelFFI.clapNFrames}x${MelFFI.clapNMels})',
-    });
-    final input = OrtValueTensor.createTensorWithDataList(
-      [mel],
-      [1, 1, MelFFI.clapNFrames, MelFFI.clapNMels],
-    );
-    final outputs = _clapAudio!.run(OrtRunOptions(), {'input_features': input});
-    return _extractFloat32List(outputs[0] as OrtValueTensor);
+    return _sendToIsolate<Float32List>([1, pcm]);
   }
 
-  /// Embed image bytes → CLIP embedding (clipDim-d).
-  /// Handles JPEG, PNG, etc.
   Future<Float32List> embedImage(Uint8List imageBytes) async {
     await _ensureInitialized();
     _touchIdleTimer();
-
-    if (imageBytes.isEmpty) {
-      throw ArgumentError('Image bytes are empty');
-    }
+    if (imageBytes.isEmpty) throw ArgumentError('Image bytes are empty');
 
     CrashLogger.instance.mark('embedImage:decode', {
       'byteLen': imageBytes.length,
     });
 
-    // Decode and resize to 224x224
     final codec = await ui.instantiateImageCodec(
       imageBytes,
       targetWidth: 224,
@@ -236,84 +145,77 @@ class EmbeddingService {
     );
     if (bitmap == null) throw Exception('Failed to decode image');
 
-    // Convert RGBA (4 bytes per pixel) to normalized RGB float32 CHW
     final pixels = bitmap.buffer.asUint8List();
-    final size = 224;
+    const size = 224;
     final floatData = Float32List(3 * size * size);
-    const meanR = 0.48145466, meanG = 0.4578275, meanB = 0.40821073;
-    const stdR = 0.26862954, stdG = 0.26130258, stdB = 0.27577711;
 
-    for (int y = 0; y < size; y++) {
-      for (int x = 0; x < size; x++) {
-        final srcIdx = (y * size + x) * 4;
-        floatData[0 * size * size + y * size + x] =
-            (pixels[srcIdx] / 255.0 - meanR) / stdR;
-        floatData[1 * size * size + y * size + x] =
-            (pixels[srcIdx + 1] / 255.0 - meanG) / stdG;
-        floatData[2 * size * size + y * size + x] =
-            (pixels[srcIdx + 2] / 255.0 - meanB) / stdB;
+    if (clipDim == 768) {
+      // SigLIP normalization: mean=0.5, std=0.5 (same for all channels)
+      for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+          final srcIdx = (y * size + x) * 4;
+          floatData[0 * size * size + y * size + x] =
+              pixels[srcIdx] / 127.5 - 1.0;
+          floatData[1 * size * size + y * size + x] =
+              pixels[srcIdx + 1] / 127.5 - 1.0;
+          floatData[2 * size * size + y * size + x] =
+              pixels[srcIdx + 2] / 127.5 - 1.0;
+        }
+      }
+    } else {
+      // CLIP normalization: per-channel mean/std
+      const meanR = 0.48145466, meanG = 0.4578275, meanB = 0.40821073;
+      const stdR = 0.26862954, stdG = 0.26130258, stdB = 0.27577711;
+      for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+          final srcIdx = (y * size + x) * 4;
+          floatData[0 * size * size + y * size + x] =
+              (pixels[srcIdx] / 255.0 - meanR) / stdR;
+          floatData[1 * size * size + y * size + x] =
+              (pixels[srcIdx + 1] / 255.0 - meanG) / stdG;
+          floatData[2 * size * size + y * size + x] =
+              (pixels[srcIdx + 2] / 255.0 - meanB) / stdB;
+        }
       }
     }
 
-    CrashLogger.instance.mark('embedImage:clipVision.run', {
+    CrashLogger.instance.mark('embedImage:isolate.send', {
       'floatDataLen': floatData.length,
     });
-    final input = OrtValueTensor.createTensorWithDataList(
-      [floatData],
-      [1, 3, size, size],
-    );
-    final outputs = _clipVision!.run(OrtRunOptions(), {'pixel_values': input});
-    return _extractFloat32List(outputs[0] as OrtValueTensor);
+    return _sendToIsolate<Float32List>([2, floatData]);
   }
 
-  /// Embed text → CLIP embedding (clipDim-d, for text queries and text files).
-  /// Requires token IDs as Int64List.
   Future<Float32List> embedClipText(Int64List tokenIds) async {
     await _ensureInitialized();
     _touchIdleTimer();
-    if (tokenIds.isEmpty) {
-      throw ArgumentError('Token IDs are empty');
-    }
-    CrashLogger.instance.mark('embedClipText:clipText.run', {
+    if (tokenIds.isEmpty) throw ArgumentError('Token IDs are empty');
+    CrashLogger.instance.mark('embedClipText:isolate.send', {
       'tokenLen': tokenIds.length,
     });
-    final input = OrtValueTensor.createTensorWithDataList(
-      [tokenIds],
-      [1, tokenIds.length],
+    final emb = await _sendToIsolate<Float32List>([3, tokenIds]);
+    debugPrint(
+      '[embed] embedClipText: dim=${emb.length} first5=${emb[0].toStringAsFixed(4)},${emb[1].toStringAsFixed(4)},${emb[2].toStringAsFixed(4)},${emb[3].toStringAsFixed(4)},${emb[4].toStringAsFixed(4)}',
     );
-    final outputs = _clipText!.run(OrtRunOptions(), {'input_ids': input});
-    return _extractFloat32List(outputs[0] as OrtValueTensor);
+    return emb;
   }
 
-  /// Embed text → 512d CLAP embedding (for audio-related text queries).
-  /// Requires token IDs as Int64List.
   Future<Float32List> embedClapText(Int64List tokenIds) async {
     await _ensureInitialized();
     _touchIdleTimer();
-    if (tokenIds.isEmpty) {
-      throw ArgumentError('Token IDs are empty');
-    }
-    CrashLogger.instance.mark('embedClapText:clapText.run', {
+    if (tokenIds.isEmpty) throw ArgumentError('Token IDs are empty');
+    CrashLogger.instance.mark('embedClapText:isolate.send', {
       'tokenLen': tokenIds.length,
     });
-    final input = OrtValueTensor.createTensorWithDataList(
-      [tokenIds],
-      [1, tokenIds.length],
-    );
-    final outputs = _clapText!.run(OrtRunOptions(), {'input_ids': input});
-    return _extractFloat32List(outputs[0] as OrtValueTensor);
+    return _sendToIsolate<Float32List>([4, tokenIds]);
   }
 
-  /// Copy models from [src] to app support dir
   Future<String> ensureModelsInAppDir({String? src}) async {
     final dest = p.join(
       (await getApplicationSupportDirectory()).path,
       'models',
     );
     final srcPath = src ?? p.join(Directory.current.path, 'searchmodels');
-
     if (await Directory(p.join(dest, 'clip')).exists()) return dest;
-
     try {
       await _copyDir(
         Directory(p.join(srcPath, 'clip')),
@@ -323,6 +225,15 @@ class EmbeddingService {
         Directory(p.join(srcPath, 'clap')),
         Directory(p.join(dest, 'clap')),
       );
+      // OCR + Whisper (from 'new' tier or fallback)
+      final ocrSrc = p.join(srcPath, 'new', 'ocr');
+      if (await Directory(ocrSrc).exists()) {
+        await _copyDir(Directory(ocrSrc), Directory(p.join(dest, 'ocr')));
+      }
+      final whisperSrc = p.join(srcPath, 'new', 'whisper');
+      if (await Directory(whisperSrc).exists()) {
+        await _copyDir(Directory(whisperSrc), Directory(p.join(dest, 'whisper')));
+      }
       debugPrint('[embedding] models copied to $dest');
     } catch (e) {
       debugPrint('[embedding] failed to copy models: $e');
@@ -341,12 +252,10 @@ class EmbeddingService {
 
   Future<void> _ensureInitialized() async {
     if (_initialized) return;
-    if (_lastTier != null) {
+    if (_modelsBasePath != null) {
       await initialize(
         modelsPath: _modelsBasePath,
-        tier: _lastTier,
         gpuProvider: _lastGpuProvider,
-        clipDim: _lastClipDim,
       );
     }
     if (!_initialized) {
@@ -354,34 +263,9 @@ class EmbeddingService {
     }
   }
 
-  static int clipDimForTier(String tier) => tier == 'high' ? 768 : 512;
+  static int clipDimForTier(String tier) => 768;
 
   static Future<String> resolveModelsPath() => _resolveModelsPath();
-
-  static Float32List _extractFloat32List(OrtValueTensor tensor) {
-    final v = tensor.value;
-    if (v is Float64List) return Float32List.fromList(v);
-    if (v is Float32List) return v;
-    if (v is List<double>) return Float32List.fromList(v);
-    if (v is List<num>) {
-      return Float32List.fromList(v.map((e) => e.toDouble()).toList());
-    }
-    if (v is List<List<double>>) {
-      return Float32List.fromList(v.expand((r) => r).toList());
-    }
-    if (v is List) {
-      final flat = <double>[];
-      for (final e in v) {
-        if (e is List) {
-          for (final inner in e) {
-            if (inner is double) flat.add(inner);
-          }
-        }
-      }
-      if (flat.isNotEmpty) return Float32List.fromList(flat);
-    }
-    throw Exception('Unexpected tensor value type: ${v.runtimeType}');
-  }
 }
 
 Future<String> _resolveModelsPath() async {

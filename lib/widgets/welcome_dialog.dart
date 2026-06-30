@@ -181,7 +181,7 @@ class _TutorialDialogState extends State<_TutorialDialog> {
   bool _indexed = false;
 
   // slide 3
-  String _tier = 'low';
+  String _tier = 'lite';
   bool _loadingSpecs = true;
   String _tierRecommendation = '';
   bool _modelBusy = false;
@@ -202,7 +202,13 @@ class _TutorialDialogState extends State<_TutorialDialog> {
     final specs = await SystemSpecs.detect();
     if (!mounted) return;
     setState(() {
-      _tier = saved.isNotEmpty ? saved : specs.tierRecommendation;
+      if (saved == 'low') {
+        _tier = 'lite';
+      } else if (saved == 'high') {
+        _tier = 'full';
+      } else {
+        _tier = saved.isNotEmpty ? saved : specs.tierRecommendation;
+      }
       _tierRecommendation = specs.tierRecommendation;
       _loadingSpecs = false;
     });
@@ -699,15 +705,15 @@ class _TutorialDialogState extends State<_TutorialDialog> {
           ),
           const SizedBox(height: 6),
           Text(
-            'low tier models are faster, but have lower accuracy. '
-            'high tier is more accurate, but less performant.',
+            'lite tier models are faster, but have lower accuracy. '
+            'full tier is more accurate, but less performant.',
             style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
           if (!_loadingSpecs) ...[
             const SizedBox(height: 2),
             Text(
-              'i decided that $_tierRecommendation is the better tier '
-              'for you.',
+              'i recommend the ${_tierRecommendation == 'lite' ? 'lite' : 'full'} tier '
+                  'for you.',
               style: TextStyle(
                 fontSize: 11,
                 color: cs.primary,
@@ -727,24 +733,31 @@ class _TutorialDialogState extends State<_TutorialDialog> {
 
   Widget _buildTutorialTierCards(ColorScheme cs) {
     const metas = {
-      'low': {
-        'label': 'Low',
-        'desc': 'CLIP ViT-B/32 + CLAP',
-        'clip': '512d',
+      'lite': {
+        'label': 'Lite',
+        'desc': 'SigLIP vision + text (768d)',
+        'clip': '768d',
         'vram': '1.2 GB',
         'ram': '600 MB',
       },
-      'high': {
-        'label': 'High',
-        'desc': 'CLIP ViT-L/14 + CLAP',
+      'mid': {
+        'label': 'Mid',
+        'desc': 'SigLIP + OCR + Whisper Tiny',
+        'clip': '768d',
+        'vram': '1.9 GB',
+        'ram': '900 MB',
+      },
+      'full': {
+        'label': 'Full',
+        'desc': 'SigLIP + CLAP + OCR + Whisper Tiny',
         'clip': '768d',
         'vram': '2.8 GB',
-        'ram': '1.2 GB',
+        'ram': '1.4 GB',
       },
     };
 
     return Row(
-      children: ['low', 'high'].map((t) {
+      children: ['lite', 'mid', 'full'].map((t) {
         final sel = _tier == t;
         final meta = metas[t]!;
         return Expanded(
@@ -757,7 +770,7 @@ class _TutorialDialogState extends State<_TutorialDialog> {
                 : null,
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
-              margin: EdgeInsets.only(right: t == 'low' ? 4 : 0),
+              margin: EdgeInsets.only(right: t != 'full' ? 4 : 0),
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
                 color: sel
@@ -845,7 +858,7 @@ class _TutorialDialogState extends State<_TutorialDialog> {
         _actionBtn(
           cs,
           Icons.download,
-          'Download ${_tier == 'low' ? 'Low' : 'High'} Models',
+          'Download ${tierMeta[_tier]!['label']} Models',
           _modelBusy
               ? null
               : () => _downloadModels(tierMeta[_tier]!['remoteUrl']!),
@@ -1045,7 +1058,7 @@ class _TutorialDialogState extends State<_TutorialDialog> {
       final firstParts = firstFile.name.split('/');
       final stripTop =
           firstParts.length > 2 &&
-          ['clip', 'clap', 'manifest.yaml'].contains(firstParts[1]);
+          ['clip', 'clap', 'ocr', 'whisper', 'manifest.yaml'].contains(firstParts[1]);
 
       for (final entry in archive) {
         if (entry.isFile) {

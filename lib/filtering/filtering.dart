@@ -35,6 +35,19 @@ List<Map<String, Object?>> _computeScoresInIsolate(
   final statuses = params['statuses'] as List<String>;
   final clipBlobs = params['clipBlobs'] as List<Uint8List?>;
   final clapBlobs = params['clapBlobs'] as List<Uint8List?>;
+  final ocrBlobs = params['ocrBlobs'] as List<Uint8List?>;
+  final transcriptBlobs = params['transcriptBlobs'] as List<Uint8List?>;
+
+  if (queryClip != null) {
+    // debug: check query embedding stats
+    double qsum = 0, qsumsq = 0;
+    for (int i = 0; i < clipDim; i++) { qsum += queryClip[i]; qsumsq += queryClip[i] * queryClip[i]; }
+    // ignore: avoid_print
+    print('[score] queryClip dim=$clipDim first5=${queryClip[0].toStringAsFixed(4)},${queryClip[1].toStringAsFixed(4)},${queryClip[2].toStringAsFixed(4)},${queryClip[3].toStringAsFixed(4)},${queryClip[4].toStringAsFixed(4)} mean=${(qsum/clipDim).toStringAsFixed(4)} norm=${sqrt(qsumsq).toStringAsFixed(4)}');
+  }
+
+  int clipOk = 0, clipBad = 0, clapOk = 0, clapBad = 0;
+  double minCs = 1.0, maxCs = -1.0;
 
   final results = <Map<String, Object?>>[];
   for (int i = 0; i < filePaths.length; i++) {
@@ -48,18 +61,43 @@ List<Map<String, Object?>> _computeScoresInIsolate(
     if (queryClip != null && clipBlobs[i] != null) {
       final blob = clipBlobs[i]!;
       if (blob.length == cd4) {
+        clipOk++;
         final emb = Float32List.view(blob.buffer, 0, clipDim);
         clipScore = _cosineSimilarity(queryClip, emb);
+        if (clipScore > maxCs) maxCs = clipScore;
+        if (clipScore < minCs) minCs = clipScore;
         if (clipScore > bestScore) bestScore = clipScore;
+      } else {
+        clipBad++;
       }
     }
 
     if (queryClap != null && clapBlobs[i] != null) {
       final blob = clapBlobs[i]!;
       if (blob.length == ad4) {
+        clapOk++;
         final emb = Float32List.view(blob.buffer, 0, clapDim);
         clapScore = _cosineSimilarity(queryClap, emb);
         if (clapScore > bestScore) bestScore = clapScore;
+      } else {
+        clapBad++;
+      }
+    }
+
+    if (queryClip != null && ocrBlobs[i] != null) {
+      final blob = ocrBlobs[i]!;
+      if (blob.length == cd4) {
+        final emb = Float32List.view(blob.buffer, 0, clipDim);
+        final score = _cosineSimilarity(queryClip, emb);
+        if (score > bestScore) bestScore = score;
+      }
+    }
+    if (queryClip != null && transcriptBlobs[i] != null) {
+      final blob = transcriptBlobs[i]!;
+      if (blob.length == cd4) {
+        final emb = Float32List.view(blob.buffer, 0, clipDim);
+        final score = _cosineSimilarity(queryClip, emb);
+        if (score > bestScore) bestScore = score;
       }
     }
 
@@ -71,6 +109,14 @@ List<Map<String, Object?>> _computeScoresInIsolate(
       'clapScore': clapScore,
       'bestScore': bestScore,
     });
+  }
+  if (queryClip != null) {
+    // ignore: avoid_print
+    print('[score] clipBlobs: ok=$clipOk badDim=$clipBad scoreRange=${minCs.toStringAsFixed(4)}..${maxCs.toStringAsFixed(4)}');
+  }
+  if (queryClap != null) {
+    // ignore: avoid_print
+    print('[score] clapBlobs: ok=$clapOk badDim=$clapBad');
   }
   return results;
 }
@@ -403,7 +449,10 @@ class FilterService extends ChangeNotifier {
     _clipMode = true;
     _clapMode = false;
     final q = _query.toLowerCase();
-    if (q.contains('@audiocontent')) _clapMode = true;
+    if (q.contains('@audiocontent')) {
+      _clapMode = true;
+      _clipMode = false;
+    }
     if (q.contains('@imagecontent')) _clipMode = true;
     if (!_clipMode && !_clapMode) _clipMode = true; // fallback
 
@@ -421,12 +470,10 @@ class FilterService extends ChangeNotifier {
   Future<void> _autoInitEmbedding() async {
     try {
       final modelsPath = await EmbeddingService.resolveModelsPath();
-      final tier = PlayerPrefs.getString('model_tier', 'low');
-      final clipDim = EmbeddingService.clipDimForTier(tier);
+      final tier = PlayerPrefs.getString('model_tier', 'lite');
       await EmbeddingService.instance.initialize(
         modelsPath: modelsPath,
         tier: tier,
-        clipDim: clipDim,
       );
     } catch (e) {
       debugPrint('[filter] auto-init embedding failed: $e');
@@ -484,11 +531,14 @@ class FilterService extends ChangeNotifier {
       tagPaths = tagPaths.where((p) => allowed.contains(p)).toSet();
     }
 
-    // Intersect: if both tag and semantic, return intersection
+    // Intersect: if both tag and semantic, return score-sorted intersection
     if (_expression != null && _semanticText.isNotEmpty) {
       final semanticSet = semanticPaths.toSet();
       _scores.removeWhere((k, _) => !semanticSet.contains(k));
-      return tagPaths.where((p) => semanticSet.contains(p)).toList();
+      final intersection = tagPaths.where((p) => semanticSet.contains(p)).toSet();
+      final sorted = intersection.toList()
+        ..sort((a, b) => (_scores[b] ?? 0).compareTo(_scores[a] ?? 0));
+      return sorted;
     }
 
     if (_semanticText.isNotEmpty) {
@@ -514,11 +564,16 @@ class FilterService extends ChangeNotifier {
     }
     Float32List? queryClap;
     if (_clapMode) {
-      final clapTok = HuggingFaceTokenizer.fromFile(
-        p.join(svc.modelsPath!, 'clap', 'tokenizer.json'),
-      );
-      final clapIds = clapTok.encodeClap(_semanticText);
-      queryClap = await svc.embedClapText(clapIds);
+      final clapTokPath = p.join(svc.modelsPath!, 'clap', 'tokenizer.json');
+      if (!File(clapTokPath).existsSync()) {
+        stderr.writeln('[memefolder] CLAP models not available for this tier, falling back to CLIP');
+        _clapMode = false;
+        _clipMode = true;
+      } else {
+        final clapTok = HuggingFaceTokenizer.fromFile(clapTokPath);
+        final clapIds = clapTok.encodeClap(_semanticText);
+        queryClap = await svc.embedClapText(clapIds);
+      }
     }
 
     // Scan DB for files with embeddings
@@ -534,8 +589,8 @@ class FilterService extends ChangeNotifier {
           'SELECT model_tier FROM roots WHERE id = 1',
         );
         if (rows.isNotEmpty) {
-          final dbTier = rows.first['model_tier'] as String? ?? 'low';
-          final currentTier = PlayerPrefs.getString('model_tier', 'low');
+          final dbTier = rows.first['model_tier'] as String? ?? 'lite';
+          final currentTier = PlayerPrefs.getString('model_tier', 'lite');
           if (dbTier != currentTier) {
             showBubble(
               Row(
@@ -573,7 +628,8 @@ class FilterService extends ChangeNotifier {
       final mediaList = mediaWhere.toSet().toList();
       final placeholders = mediaList.map((_) => '?').join(',');
       final rows = await db.rawQuery('''
-        SELECT id, rel_path, clip_emb, clap_emb, metadata_emb, status
+        SELECT id, rel_path, clip_emb, clap_emb, metadata_emb,
+               ocr_emb, transcript_emb, status
         FROM files
         WHERE media_type IN ($placeholders)
       ''', mediaList);
@@ -585,12 +641,19 @@ class FilterService extends ChangeNotifier {
       final statuses = <String>[];
       final clipBlobs = <Uint8List?>[];
       final clapBlobs = <Uint8List?>[];
+      final ocrBlobs = <Uint8List?>[];
+      final transcriptBlobs = <Uint8List?>[];
+      final seen = <String>{};
 
       for (final row in rows) {
-        filePaths.add(p.join(rootPath, row['rel_path'] as String));
+        final path = p.join(rootPath, row['rel_path'] as String);
+        if (!seen.add(path)) continue;
+        filePaths.add(path);
         statuses.add(row['status'] as String? ?? '');
         clipBlobs.add(row['clip_emb'] as Uint8List?);
         clapBlobs.add(row['clap_emb'] as Uint8List?);
+        ocrBlobs.add(row['ocr_emb'] as Uint8List?);
+        transcriptBlobs.add(row['transcript_emb'] as Uint8List?);
       }
 
       final params = <String, Object?>{
@@ -602,6 +665,8 @@ class FilterService extends ChangeNotifier {
         'statuses': statuses,
         'clipBlobs': clipBlobs,
         'clapBlobs': clapBlobs,
+        'ocrBlobs': ocrBlobs,
+        'transcriptBlobs': transcriptBlobs,
       };
 
       final results = await compute(_computeScoresInIsolate, params);
@@ -622,7 +687,7 @@ class FilterService extends ChangeNotifier {
     if (_scores.isEmpty) return [];
 
     // min-max normalize each score map to [0, 100]
-    void normalizeMap(Map<String, double?> map) {
+    void normalizeMap(Map<String, double?> map, String label) {
       final keys = map.keys
           .where((k) => map[k] != null && _scores[k]! >= 0)
           .toList();
@@ -634,17 +699,21 @@ class FilterService extends ChangeNotifier {
           if (v > maxV) maxV = v;
         }
         final range = maxV - minV;
+        debugPrint('[score] $label: ${keys.length} entries min=$minV max=$maxV range=$range');
         for (final k in keys) {
           map[k] = range > 0 ? ((map[k]! - minV) / range) * 100.0 : 100.0;
         }
       } else if (keys.length == 1) {
+        debugPrint('[score] $label: single entry, setting 100');
         map[keys[0]] = 100.0;
+      } else {
+        debugPrint('[score] $label: no valid entries');
       }
     }
 
-    normalizeMap(_scores.cast<String, double?>());
-    normalizeMap(_clipScores);
-    normalizeMap(_clapScores);
+    normalizeMap(_scores.cast<String, double?>(), 'best');
+    normalizeMap(_clipScores, 'clip');
+    normalizeMap(_clapScores, 'clap');
 
     // Sort descending by best score, put failed at end
     final sorted = _scores.entries.toList()

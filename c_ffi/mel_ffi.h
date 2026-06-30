@@ -63,6 +63,27 @@ MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* o
  */
 MEL_FFI_EXPORT int preprocess_clip_image(const unsigned char* image_data, int data_len, float* output);
 
+/* Whisper mel spectrogram parameters */
+#define WHISPER_SAMPLE_RATE   16000
+#define WHISPER_MAX_SAMPLES   480000   /* 30 seconds */
+#define WHISPER_N_FFT         400
+#define WHISPER_HOP_LENGTH    160
+#define WHISPER_N_MELS        80
+#define WHISPER_N_FRAMES      3000     /* 30s / 10ms hop */
+
+/*
+ * Compute Whisper log-mel spectrogram from raw PCM audio.
+ *
+ * pcm: 16kHz mono PCM samples (float32, range [-1, 1])
+ * num_samples: number of input samples
+ * output: pre-allocated array of WHISPER_N_FRAMES * WHISPER_N_MELS floats
+ *         output is row-major: [frame][mel_band]
+ *
+ * Handles truncation to 30s and zero-padding internally.
+ * Uses reflection padding at signal boundaries.
+ */
+MEL_FFI_EXPORT void compute_whisper_mel(const float* pcm, int num_samples, float* output);
+
 #ifdef __cplusplus
 }
 #endif

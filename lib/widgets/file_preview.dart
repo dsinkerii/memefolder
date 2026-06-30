@@ -114,6 +114,8 @@ class FilePreviewPane extends StatelessWidget {
                             _TagsSection(file: currentFile),
                             const SizedBox(height: 12),
                             _AudioMetadataSection(file: currentFile),
+                            const SizedBox(height: 12),
+                            _EmbeddingsSection(file: currentFile),
                           ],
                         ],
                       ),
@@ -2034,3 +2036,182 @@ const _audioExtensions = {
   'opus',
   'wma',
 };
+
+class _EmbeddingsSection extends StatefulWidget {
+  const _EmbeddingsSection({required this.file});
+  final File file;
+
+  @override
+  State<_EmbeddingsSection> createState() => _EmbeddingsSectionState();
+}
+
+class _EmbeddingsSectionState extends State<_EmbeddingsSection> {
+  late Future<Map<String, dynamic>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _EmbeddingsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.path != widget.file.path) {
+      _future = _load();
+    }
+  }
+
+  Future<Map<String, dynamic>> _load() async {
+    final root = PlayerPrefs.getString("main_folder");
+    if (root.isEmpty) return {};
+    return getFileEmbeddingInfo(root, widget.file.path);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return FutureBuilder<Map<String, dynamic>>(
+      future: _future,
+      builder: (context, snapshot) {
+        final data = snapshot.data;
+
+        final clipEmb = data?['clip_emb'] as Uint8List?;
+        final clapEmb = data?['clap_emb'] as Uint8List?;
+        final metaEmb = data?['metadata_emb'] as Uint8List?;
+        final ocrEmb = data?['ocr_emb'] as Uint8List?;
+        final transEmb = data?['transcript_emb'] as Uint8List?;
+        final ocrText = (data?['ocr_text'] as String?) ?? '';
+        final transcriptText = (data?['transcript_text'] as String?) ?? '';
+
+        String fmtBytes(int bytes) {
+          if (bytes < 1024) return '$bytes B';
+          return '${(bytes / 1024).toStringAsFixed(1)} KB';
+        }
+
+        String fmtDim(Uint8List? blob, int floatSize) {
+          if (blob == null) return '—';
+          final floats = blob.length ~/ floatSize;
+          return '$floats floats (${fmtBytes(blob.length)})';
+        }
+
+        Widget row(String label, String value) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: cs.onSurfaceVariant.withAlpha(180),
+                  ),
+                ),
+                Flexible(
+                  child: Text(
+                    value,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: cs.onSurface.withAlpha(200),
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        Widget textBlock(String label, String content) {
+          return Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: cs.onSurfaceVariant.withAlpha(150),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest.withAlpha(120),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    content,
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: content == 'none'
+                          ? cs.onSurfaceVariant.withAlpha(120)
+                          : cs.onSurface.withAlpha(180),
+                      fontStyle: content == 'none'
+                          ? FontStyle.italic
+                          : FontStyle.normal,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: cs.surfaceContainerHighest.withAlpha(80),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: cs.outlineVariant.withAlpha(60),
+              width: 2,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.account_tree_outlined,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Embeddings',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              row('CLIP visual', fmtDim(clipEmb, 4)),
+              row('CLAP audio', fmtDim(clapEmb, 4)),
+              row('Metadata', fmtDim(metaEmb, 4)),
+              row('OCR', fmtDim(ocrEmb, 4)),
+              row('Transcript', fmtDim(transEmb, 4)),
+              textBlock('OCR text:', ocrText.isNotEmpty ? ocrText : 'none'),
+              textBlock(
+                'Transcript text:',
+                transcriptText.isNotEmpty ? transcriptText : 'none',
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
