@@ -83,5 +83,5 @@ indexing (w/ Samsung 990 Pro 2tb):
 running this on an Intel Core i5-9600KF (no acceleration):
 - 40 files embedded in 20 minutes (so full would take >12 hours)
 
-running this on an RTX 3060
-- bad
+running this on an RTX 3060 (CUDA runtime)
+- 192 files in ~15 minutes (so full embedding would take ~4 hours)
