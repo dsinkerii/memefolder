@@ -1,0 +1,40 @@
+version: 1
+AppDir:
+  path: ./build/linux/x64/release/bundle
+  app_info:
+    id: com.dsinkerii.memefolder
+    name: memefolder
+    icon: memefolder
+    version: 2.0.0
+    exec: memefolder
+    exec_args: ""
+  apt:
+    arch: amd64
+    allow_unauthenticated: true
+    sources:
+      - sourcelist: deb http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+        key_url: 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x871920d1991bc93c'
+    include:
+      - libgtk-3-0
+      - libsqlite3-0
+      - libavcodec-extra
+      - libavformat-extra
+      - libavutil56
+    exclude:
+      - dpkg
+  files:
+    include:
+      - /usr/lib/x86_64-linux-gnu/libgdk-3.so.*
+      - /usr/lib/x86_64-linux-gnu/libgtk-3.so.*
+      - /usr/lib/x86_64-linux-gnu/libpango-1.0.so.*
+      - /usr/lib/x86_64-linux-gnu/libcairo-gobject.so.*
+      - /usr/lib/x86_64-linux-gnu/libatk-1.0.so.*
+      - /usr/lib/x86_64-linux-gnu/libatk-bridge-2.0.so.*
+  logo: linux/runner/app_icon.png
+  symlink:
+    - /usr/bin/env
+AppImage:
+  arch: x86_64
+  update-information: None
+  sign-key: None
+  guess-arch: true
