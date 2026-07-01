@@ -23,6 +23,7 @@ void captionIsolateMain(SendPort mainSendPort) {
   OrtSession? ocrRec;
   OrtSession? whisperEnc;
   OrtSession? whisperDec;
+  OrtSession? whisperDecCached;
   MelFFI? mel;
   List<String>? ocrVocab;
   WhisperTokenizer? whisperTokenizer;
@@ -44,31 +45,25 @@ void captionIsolateMain(SendPort mainSendPort) {
               .readAsLinesSync();
           ocrVocab = [''] + lines;
 
+          OrtEnv.instance.init();
+          final availableProviders = OrtEnv.instance.availableProviders();
           final options = OrtSessionOptions();
-          if (gpuProvider != null && gpuProvider != 'CPU') {
+          final gpuUpper = gpuProvider?.toUpperCase();
+          if (gpuProvider != null && gpuUpper != 'CPU') {
             try {
-              switch (gpuProvider) {
-                case 'CUDA':
-                  options.appendCudaProvider(CUDAFlags.useNone);
-                  break;
-                case 'ROCm':
-                  options.appendRocmProvider(ROCmFlags.useNone);
-                  break;
-                case 'DirectML':
-                  options.appendDirectMLProvider();
-                  break;
-                case 'CoreML':
-                  options.appendCoreMLProvider(CoreMLFlags.useNone);
-                  break;
-                case 'OpenVINO':
-                  options.appendOpenVINOProvider();
-                  break;
-                case 'TensorRT':
-                  options.appendTensorRTProvider();
-                  break;
+              if (gpuUpper == 'CUDA' && availableProviders.contains(OrtProvider.cuda)) {
+                options.appendCudaProvider(CUDAFlags.useNone);
+              }
+            } catch (_) {}
+            try {
+              if (gpuUpper == 'TENSORRT' && (availableProviders.contains(OrtProvider.tensorrt) || availableProviders.contains(OrtProvider.nvTensorRtRtx))) {
+                options.appendNvTensorRtRtxProvider();
               }
             } catch (_) {}
           }
+          try {
+            options.appendCPUProvider(CPUFlags.useArena);
+          } catch (_) {}
           options.setIntraOpNumThreads(4);
           options.setSessionGraphOptimizationLevel(
             GraphOptimizationLevel.ortEnableAll,
@@ -98,6 +93,13 @@ void captionIsolateMain(SendPort mainSendPort) {
                 .readAsBytesSync(),
             options,
           );
+          try {
+            whisperDecCached = OrtSession.fromBuffer(
+              File(p.join(modelsPath, 'whisper', 'tiny_decoder_with_past.onnx'))
+                  .readAsBytesSync(),
+              options,
+            );
+          } catch (_) {}
 
           replyPort.send([0, null]);
           break;
@@ -105,14 +107,23 @@ void captionIsolateMain(SendPort mainSendPort) {
         case 1: // ocr recognition
           final floatData = msg[2] as Float32List;
           final width = msg[3] as int;
+          final sw = Stopwatch()..start();
           final input = OrtValueTensor.createTensorWithDataList(
             [floatData],
             [1, 3, 48, width],
           );
-          final outputs = ocrRec!.run(OrtRunOptions(), {'x': input});
+          final runOpts = OrtRunOptions();
+          final outputs = ocrRec!.run(runOpts, {'x': input});
           final logits = _extractFloat32List(outputs[0] as OrtValueTensor);
+          for (final o in outputs) {
+            try { (o as OrtValueTensor).release(); } catch (_) {}
+          }
+          input.release();
+          runOpts.release();
           final t = logits.length ~/ 18385;
           final text = _ctcGreedyDecode(logits, t, 18385, ocrVocab!);
+          sw.stop();
+          stderr.writeln('[caption-iso] ocr rec: ${sw.elapsedMilliseconds}ms w=$width t=$t');
           replyPort.send([0, text]);
           break;
 
@@ -120,19 +131,28 @@ void captionIsolateMain(SendPort mainSendPort) {
           final floatData = msg[2] as Float32List;
           final height = msg[3] as int;
           final width = msg[4] as int;
+          final sw = Stopwatch()..start();
           final input = OrtValueTensor.createTensorWithDataList(
             [floatData],
             [1, 3, height, width],
           );
-          final outputs = ocrDet!.run(OrtRunOptions(), {'x': input});
+          final runOpts = OrtRunOptions();
+          final outputs = ocrDet!.run(runOpts, {'x': input});
           final prob = _extractFloat32List(outputs[0] as OrtValueTensor);
+          for (final o in outputs) {
+            try { (o as OrtValueTensor).release(); } catch (_) {}
+          }
+          input.release();
+          runOpts.release();
+          sw.stop();
+          stderr.writeln('[caption-iso] ocr det: ${sw.elapsedMilliseconds}ms ${width}x$height');
           replyPort.send([0, prob]);
           break;
 
         case 2: // whisper
           final pcm = msg[2] as Float32List;
           stderr.writeln('[caption-iso] whisper: pcmLen=${pcm.length} start mel');
-          final text = _runWhisper(whisperEnc!, whisperDec!, mel!, pcm, whisperTokenizer!);
+          final text = _runWhisper(whisperEnc!, whisperDec!, whisperDecCached, mel!, pcm, whisperTokenizer!);
           stderr.writeln('[caption-iso] whisper: done len=${text.length}');
           replyPort.send([0, text]);
           break;
@@ -142,11 +162,13 @@ void captionIsolateMain(SendPort mainSendPort) {
           ocrRec?.release();
           whisperEnc?.release();
           whisperDec?.release();
+          whisperDecCached?.release();
           mel?.dispose();
           ocrDet = null;
           ocrRec = null;
           whisperEnc = null;
           whisperDec = null;
+          whisperDecCached = null;
           mel = null;
           break;
       }
@@ -159,6 +181,7 @@ void captionIsolateMain(SendPort mainSendPort) {
 String _runWhisper(
   OrtSession enc,
   OrtSession dec,
+  OrtSession? decCached,
   MelFFI mel,
   Float32List pcm,
   WhisperTokenizer tokenizer,
@@ -181,42 +204,162 @@ String _runWhisper(
     [1, MelFFI.whisperNMels, MelFFI.whisperNFrames],
   );
 
-  final encOuts = enc.run(OrtRunOptions(), {'input_features': melInput});
+  final encRunOpts = OrtRunOptions();
+  final encOuts = enc.run(encRunOpts, {'input_features': melInput});
   final encState = _extractFloat32List(encOuts[0] as OrtValueTensor);
+  for (final o in encOuts) {
+    try { (o as OrtValueTensor).release(); } catch (_) {}
+  }
+  melInput.release();
+  encRunOpts.release();
 
-  final generated = <int>[_sotId, _enId, _transcribeId, _notimestampsId];
+  // Create encoder hidden states tensor (reused across all decoder steps)
+  final encTensor = OrtValueTensor.createTensorWithDataList(
+    [encState],
+    [1, 1500, 384],
+  );
 
-  while (generated.length < _maxDecodeTokens) {
-    final inputIds = Int64List.fromList(generated);
-    final idsTensor = OrtValueTensor.createTensorWithDataList(
-      [inputIds],
-      [1, generated.length],
-    );
-    final encTensor = OrtValueTensor.createTensorWithDataList(
-      [encState],
-      [1, 1500, 384],
-    );
-    final decOuts = dec.run(
-      OrtRunOptions(),
-      {'input_ids': idsTensor, 'encoder_hidden_states': encTensor},
-    );
-    final logits = _extractFloat32List(decOuts[0] as OrtValueTensor);
-    final vocabSize = 51865;
-    final seqLen = generated.length;
-    final lastLogits = logits.sublist((seqLen - 1) * vocabSize, seqLen * vocabSize);
-    var nextToken = 0;
-    var bestVal = -1e30;
-    for (int i = 0; i < lastLogits.length; i++) {
-      if (lastLogits[i] > bestVal) {
-        bestVal = lastLogits[i];
-        nextToken = i;
-      }
+  // --- Step 0: run regular decoder with full prompt ---
+  final promptTokens = Int64List.fromList([_sotId, _enId, _transcribeId, _notimestampsId]);
+  final idsTensor = OrtValueTensor.createTensorWithDataList(
+    [promptTokens],
+    [1, 4],
+  );
+  final decRunOpts = OrtRunOptions();
+  final decOuts = dec.run(
+    decRunOpts,
+    {'input_ids': idsTensor, 'encoder_hidden_states': encTensor},
+  );
+  final logits0 = _extractFloat32List(decOuts[0] as OrtValueTensor);
+
+  // Capture KV cache from step 0 outputs (index-based, order is deterministic)
+  // Regular decoder outputs: [logits, present.0.dec.k, present.0.dec.v, present.0.enc.k, present.0.enc.v, ...]
+  List<Float32List>? decKvKeys;   // [4 layers] of Float32List
+  List<Float32List>? decKvValues; // [4 layers] of Float32List
+  List<Float32List>? encKvKeys;   // [4 layers] of Float32List
+  List<Float32List>? encKvValues; // [4 layers] of Float32List
+  if (decCached != null) {
+    decKvKeys = List.generate(4, (_) => Float32List(0));
+    decKvValues = List.generate(4, (_) => Float32List(0));
+    encKvKeys = List.generate(4, (_) => Float32List(0));
+    encKvValues = List.generate(4, (_) => Float32List(0));
+    // Output order: logits(0), then for each layer 0-3: dec.k(1+4*L), dec.v(2+4*L), enc.k(3+4*L), enc.v(4+4*L)
+    for (int layer = 0; layer < 4; layer++) {
+      decKvKeys[layer] = _extractFloat32List(decOuts[1 + layer * 4] as OrtValueTensor);
+      decKvValues[layer] = _extractFloat32List(decOuts[2 + layer * 4] as OrtValueTensor);
+      encKvKeys[layer] = _extractFloat32List(decOuts[3 + layer * 4] as OrtValueTensor);
+      encKvValues[layer] = _extractFloat32List(decOuts[4 + layer * 4] as OrtValueTensor);
     }
-    if (nextToken == _eosId) break;
-    generated.add(nextToken);
+  }
+  for (final o in decOuts) {
+    try { (o as OrtValueTensor).release(); } catch (_) {}
+  }
+  idsTensor.release();
+  decRunOpts.release();
+
+  // Get first predicted token from last position of prompt logits
+  final vocabSize = 51865;
+  final lastLogits0 = logits0.sublist(3 * vocabSize, 4 * vocabSize);
+  var nextToken = _argmax(lastLogits0);
+  if (nextToken == _eosId) {
+    encTensor.release();
+    return tokenizer.decodeWhisper([_sotId, _enId, _transcribeId, _notimestampsId]);
   }
 
+  final generated = <int>[_sotId, _enId, _transcribeId, _notimestampsId, nextToken];
+
+  // --- Steps 1+: use cached decoder if available ---
+  if (decCached != null) {
+    while (generated.length < _maxDecodeTokens) {
+      // Build input map for cached decoder
+      final inputMap = <String, OrtValueTensor>{};
+      final newIds = Int64List.fromList([generated.last]);
+      inputMap['input_ids'] = OrtValueTensor.createTensorWithDataList(
+        [newIds], [1, 1],
+      );
+      inputMap['encoder_hidden_states'] = encTensor;
+      for (int layer = 0; layer < 4; layer++) {
+        final decK = decKvKeys![layer];
+        final decV = decKvValues![layer];
+        final pastLen = decK.length ~/ 64 ~/ 6;
+        inputMap['past_key_values.$layer.decoder.key'] = OrtValueTensor.createTensorWithDataList(
+          [decK], [1, 6, pastLen, 64],
+        );
+        inputMap['past_key_values.$layer.decoder.value'] = OrtValueTensor.createTensorWithDataList(
+          [decV], [1, 6, pastLen, 64],
+        );
+        inputMap['past_key_values.$layer.encoder.key'] = OrtValueTensor.createTensorWithDataList(
+          [encKvKeys![layer]], [1, 6, 1500, 64],
+        );
+        inputMap['past_key_values.$layer.encoder.value'] = OrtValueTensor.createTensorWithDataList(
+          [encKvValues![layer]], [1, 6, 1500, 64],
+        );
+      }
+
+      final runOpts = OrtRunOptions();
+      final outs = decCached.run(runOpts, inputMap);
+      final logits = _extractFloat32List(outs[0] as OrtValueTensor);
+
+      // Update decoder KV cache from present outputs
+      // Cached decoder output order: logits(0), then for each layer 0-3: dec.k(1+2*L), dec.v(2+2*L)
+      for (int layer = 0; layer < 4; layer++) {
+        decKvKeys![layer] = _extractFloat32List(outs[1 + layer * 2] as OrtValueTensor);
+        decKvValues![layer] = _extractFloat32List(outs[2 + layer * 2] as OrtValueTensor);
+      }
+
+      // Release all tensors
+      for (final o in outs) {
+        try { (o as OrtValueTensor).release(); } catch (_) {}
+      }
+      for (final entry in inputMap.entries) {
+        if (entry.key != 'encoder_hidden_states') {
+          entry.value.release();
+        }
+      }
+      runOpts.release();
+
+      nextToken = _argmax(logits.sublist(0, vocabSize));
+      if (nextToken == _eosId) break;
+      generated.add(nextToken);
+    }
+  } else {
+    // Fallback: no cached decoder, use original O(N) loop
+    while (generated.length < _maxDecodeTokens) {
+      final inputIds = Int64List.fromList(generated);
+      final idsT = OrtValueTensor.createTensorWithDataList(
+        [inputIds], [1, generated.length],
+      );
+      final runOpts = OrtRunOptions();
+      final outs = dec.run(
+        runOpts,
+        {'input_ids': idsT, 'encoder_hidden_states': encTensor},
+      );
+      final logits = _extractFloat32List(outs[0] as OrtValueTensor);
+      for (final o in outs) {
+        try { (o as OrtValueTensor).release(); } catch (_) {}
+      }
+      idsT.release();
+      runOpts.release();
+      nextToken = _argmax(logits.sublist((generated.length - 1) * vocabSize, generated.length * vocabSize));
+      if (nextToken == _eosId) break;
+      generated.add(nextToken);
+    }
+  }
+
+  encTensor.release();
   return tokenizer.decodeWhisper(generated);
+}
+
+int _argmax(Float32List logits) {
+  var bestIdx = 0;
+  var bestVal = -1e30;
+  for (int i = 0; i < logits.length; i++) {
+    if (logits[i] > bestVal) {
+      bestVal = logits[i];
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
 }
 
 String _ctcGreedyDecode(
@@ -227,6 +370,7 @@ String _ctcGreedyDecode(
 ) {
   final sb = StringBuffer();
   var prevIdx = 0;
+  var blankStreak = 0;
   for (int t = 0; t < timeSteps; t++) {
     var bestIdx = 0;
     var bestVal = -1e30;
@@ -237,7 +381,11 @@ String _ctcGreedyDecode(
         bestIdx = c;
       }
     }
-    if (bestIdx != prevIdx && bestIdx != 0) {
+    if (bestIdx == 0 || bestIdx == prevIdx) {
+      blankStreak++;
+      if (blankStreak > 30 && sb.isNotEmpty) break;
+    } else {
+      blankStreak = 0;
       if (bestIdx < vocab.length) {
         sb.write(vocab[bestIdx]);
       }

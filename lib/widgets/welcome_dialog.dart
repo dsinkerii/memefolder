@@ -865,44 +865,42 @@ class _TutorialDialogState extends State<_TutorialDialog> {
           cs.primary,
         ),
         const SizedBox(height: 6),
-        GestureDetector(
-          onTap: _modelBusy ? null : _uploadZip,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOut,
-            decoration: BoxDecoration(
-              color: _dragHoveringZip
-                  ? cs.primary.withValues(alpha: 0.08)
-                  : cs.surfaceContainerHighest.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: DottedBorder(
-              options: RoundedRectDottedBorderOptions(
-                dashPattern: const [6, 3],
-                strokeWidth: 1.5,
+        DropTarget(
+          onDragEntered: (_) {
+            if (!_modelBusy) setState(() => _dragHoveringZip = true);
+          },
+          onDragExited: (_) {
+            if (_dragHoveringZip) setState(() => _dragHoveringZip = false);
+          },
+          onDragDone: (details) async {
+            setState(() => _dragHoveringZip = false);
+            final f = details.files.firstOrNull;
+            if (f == null || !f.name.endsWith('.zip')) return;
+            _extractZip(await f.readAsBytes());
+          },
+          child: GestureDetector(
+            onTap: _modelBusy ? null : () => _uploadZip(),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              decoration: BoxDecoration(
                 color: _dragHoveringZip
-                    ? cs.primary
-                    : cs.onSurfaceVariant.withValues(alpha: 0.45),
-                radius: const Radius.circular(8),
+                    ? cs.primary.withValues(alpha: 0.08)
+                    : cs.surfaceContainerHighest.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(8),
               ),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: DropTarget(
-                  onDragEntered: (_) {
-                    if (!_modelBusy) { setState(() => _dragHoveringZip = true); }
-                  },
-                  onDragExited: (_) {
-                    if (_dragHoveringZip) {
-                      setState(() => _dragHoveringZip = false);
-                    }
-                  },
-                  onDragDone: (details) async {
-                    setState(() => _dragHoveringZip = false);
-                    final f = details.files.firstOrNull;
-                    if (f == null || !f.name.endsWith('.zip')) return;
-                    _extractZip(await f.readAsBytes());
-                  },
+              child: DottedBorder(
+                options: RoundedRectDottedBorderOptions(
+                  dashPattern: const [6, 3],
+                  strokeWidth: 1.5,
+                  color: _dragHoveringZip
+                      ? cs.primary
+                      : cs.onSurfaceVariant.withValues(alpha: 0.45),
+                  radius: const Radius.circular(8),
+                ),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 6),
                   child: Column(
                     children: [
                       Icon(

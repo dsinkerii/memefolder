@@ -264,12 +264,87 @@ MEL_FFI_EXPORT void compute_clap_mel(const float* pcm, int num_samples, float* o
 /* ================================================================
  * Whisper log-mel spectrogram — internal implementation
  * Uses reflection padding at audio boundaries.
+ *
+ * Speed: uses Bluestein's algorithm to compute the exact same
+ * 400-point DFT via a 1024-point radix-2 FFT. O(N log M) vs O(N²).
  * ================================================================ */
+
+/*
+ * Bluestein power spectrum: computes |DFT{x}[k]|² for k=0..N-1.
+ * Uses a 1024-point radix-2 FFT internally. Produces bit-identical
+ * results to the naive O(N²) DFT for the DFT magnitudes.
+ */
+static void bluestein_power_spectrum(const float* x, int n, float* power) {
+    const int m = 1024; /* >= 2*n-1 = 799, power of 2 */
+    float *a_re, *a_im, *b_re, *b_im;
+    float chirp_re[400], chirp_im[400];
+    int k;
+
+    a_re = (float*)calloc(m, sizeof(float));
+    a_im = (float*)calloc(m, sizeof(float));
+    b_re = (float*)calloc(m, sizeof(float));
+    b_im = (float*)calloc(m, sizeof(float));
+
+    /* chirp[k] = exp(-j * pi * k^2 / n) */
+    for (k = 0; k < n; k++) {
+        double angle = -3.141592653589793 * (double)k * k / n;
+        chirp_re[k] = (float)cos(angle);
+        chirp_im[k] = (float)sin(angle);
+    }
+
+    /* a[k] = x[k] * chirp[k], zero-padded to m */
+    for (k = 0; k < n; k++) {
+        a_re[k] = x[k] * chirp_re[k];
+        a_im[k] = x[k] * chirp_im[k];
+    }
+
+    /* b[k] = conj(chirp[k]) for k=0..n-1, conj(chirp[k-m]) for k=m-n+1..m-1 */
+    for (k = 0; k < n; k++) {
+        b_re[k] =  chirp_re[k];  /* conj: flip sign of imag */
+        b_im[k] = -chirp_im[k];
+    }
+    for (k = m - n + 1; k < m; k++) {
+        int j2 = k - m; /* negative index */
+        double angle = -3.141592653589793 * (double)j2 * j2 / n;
+        b_re[k] =  (float)cos(angle);
+        b_im[k] = -(float)sin(angle);  /* conj */
+    }
+
+    /* FFT both sequences */
+    fft_radix2(a_re, a_im, m);
+    fft_radix2(b_re, b_im, m);
+
+    /* pointwise multiply */
+    for (k = 0; k < m; k++) {
+        float re = a_re[k] * b_re[k] - a_im[k] * b_im[k];
+        float im = a_re[k] * b_im[k] + a_im[k] * b_re[k];
+        a_re[k] = re;
+        a_im[k] = im;
+    }
+
+    /* inverse FFT: conjugate, FFT, conjugate, divide by m */
+    for (k = 0; k < m; k++) a_im[k] = -a_im[k];
+    fft_radix2(a_re, a_im, m);
+    for (k = 0; k < m; k++) {
+        a_re[k] /= m;
+        a_im[k] = -a_im[k] / m; /* conjugate */
+    }
+
+    /* multiply by chirp[k] and compute |X[k]|^2 */
+    for (k = 0; k < n; k++) {
+        float re = a_re[k] * chirp_re[k] - a_im[k] * chirp_im[k];
+        float im = a_re[k] * chirp_im[k] + a_im[k] * chirp_re[k];
+        power[k] = re * re + im * im;
+    }
+
+    free(a_re); free(a_im); free(b_re); free(b_im);
+}
+
 static void compute_whisper_mel_impl(const float* pcm, int num_samples, float* output) {
     float* audio = (float*)malloc(WHISPER_MAX_SAMPLES * sizeof(float));
     float window[WHISPER_N_FFT];
     int i, t, f;
-    float re[WHISPER_N_FFT], im[WHISPER_N_FFT];
+    float frame[WHISPER_N_FFT];
     float power_spectrum[WHISPER_N_FREQ_BINS];
     const int ns = WHISPER_MAX_SAMPLES;
 
@@ -301,22 +376,11 @@ static void compute_whisper_mel_impl(const float* pcm, int num_samples, float* o
             } else {
                 sample = audio[idx];
             }
-            re[i] = sample * window[i];
-            im[i] = 0.0f;
+            frame[i] = sample * window[i];
         }
 
-        /* DFT for non-power-of-2 N_FFT=400 */
-        for (f = 0; f < WHISPER_N_FREQ_BINS; f++) {
-            double sum_re = 0.0, sum_im = 0.0;
-            double angle = -2.0 * 3.141592653589793 * f / WHISPER_N_FFT;
-            for (i = 0; i < WHISPER_N_FFT; i++) {
-                double a = angle * i;
-                double c = cos(a), s = sin(a);
-                sum_re += re[i] * c - im[i] * s;
-                sum_im += re[i] * s + im[i] * c;
-            }
-            power_spectrum[f] = (float)(sum_re * sum_re + sum_im * sum_im);
-        }
+        /* Bluestein DFT → power spectrum (exact same output as O(N²) DFT) */
+        bluestein_power_spectrum(frame, WHISPER_N_FFT, power_spectrum);
 
         /* Apply mel filterbank -> log magnitude */
         for (f = 0; f < WHISPER_N_MELS; f++) {

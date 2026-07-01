@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_vector_icons/flutter_vector_icons.dart';
 import 'package:http/http.dart' as http;
 import 'package:memefolder/widgets/bubble_snackbar.dart';
+import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -61,7 +62,7 @@ const tierMeta = {
     'desc': 'SigLIP vision + text (768d)',
     'clip': '768d',
     'vram': '1.2 GB',
-    'ram': '600 MB',
+    'ram': '1.3 GB',
     'remoteUrl': '',
   },
   'mid': {
@@ -69,15 +70,15 @@ const tierMeta = {
     'desc': 'SigLIP + OCR + Whisper Tiny',
     'clip': '768d',
     'vram': '1.9 GB',
-    'ram': '900 MB',
+    'ram': '1.6 GB',
     'remoteUrl': '',
   },
   'full': {
     'label': 'Full',
-    'desc': 'SigLIP + CLAP + OCR + Whisper Tiny',
+    'desc': 'SigLIP + CLAP + OCR + Whisper',
     'clip': '768d',
     'vram': '2.8 GB',
-    'ram': '1.4 GB',
+    'ram': '2 GB',
     'remoteUrl': '',
   },
 };
@@ -101,10 +102,14 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   bool _busy = false;
   double _progress = 0;
   String? _statusMsg;
+  String _selectedProvider = 'auto';
+
+  static const _providerPrefKey = 'gpu_provider_override';
 
   @override
   void initState() {
     super.initState();
+    _selectedProvider = PlayerPrefs.getString(_providerPrefKey, 'auto');
     _loadSpecs();
   }
 
@@ -165,6 +170,18 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     PlayerPrefs.setString('model_tier', tier);
   }
 
+  void _setProvider(String provider) {
+    setState(() => _selectedProvider = provider);
+    PlayerPrefs.setString(_providerPrefKey, provider);
+  }
+
+  String _resolveGpuProvider() {
+    if (_selectedProvider == 'auto') {
+      return _specs?.recommendedGpuProvider ?? 'CPU';
+    }
+    return _selectedProvider;
+  }
+
   Future<void> _downloadModels() async {
     final url = tierMeta[_tier]!['remoteUrl'] as String;
     if (url.isEmpty) {
@@ -206,34 +223,35 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
   }
 
   Future<void> _uploadZip({Uint8List? bytes}) async {
+    Uint8List data;
     if (bytes != null) {
+      data = bytes;
+    } else {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['zip'],
       );
       if (result == null || result.files.isEmpty) return;
-      setState(() async {
+      setState(() {
         _busy = true;
         _progress = 0;
         _statusMsg = 'Extracting...';
-
-        try {
-          final bytespromise =
-              result.files.single.bytes ??
-              await File(result.files.single.path!).readAsBytes();
-          bytes = bytespromise;
-        } catch (e) {
-          if (mounted) {
-            setState(() {
-              _busy = false;
-              _statusMsg = 'Failed: $e';
-            });
-          }
-          return;
-        }
       });
+      try {
+        data =
+            result.files.single.bytes ??
+            await File(result.files.single.path!).readAsBytes();
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _statusMsg = 'Failed: $e';
+          });
+        }
+        return;
+      }
     }
-    if (bytes != null) await _extractZip(bytes!);
+    await _extractZip(data);
   }
 
   Future<void> _extractZip(Uint8List bytes) async {
@@ -310,7 +328,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
       _statusMsg = 'Loading...';
     });
     try {
-      final gpuProvider = _specs?.recommendedGpuProvider;
+      final gpuProvider = _resolveGpuProvider();
       await EmbeddingService.instance.initialize(
         modelsPath: _basePath,
         gpuProvider: gpuProvider,
@@ -318,7 +336,8 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
       );
       if (mounted) {
         final gpuErr = EmbeddingService.instance.gpuInitError;
-        if (gpuProvider != null && gpuProvider != 'CPU' && gpuErr != null) {
+        final actualProvider = EmbeddingService.instance.gpuProvider;
+        if (gpuProvider != 'CPU' && gpuErr != null) {
           setState(() {
             _busy = false;
             _statusMsg = 'Models loaded, but GPU acceleration failed:\n$gpuErr';
@@ -337,7 +356,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           });
           Navigator.of(context).pop();
         } else {
-          if (gpuProvider == null || gpuProvider == 'CPU') {
+          if (actualProvider == 'CPU') {
             setState(() => _statusMsg = 'Loaded! (CPU only)');
             showBubble(
               Text(
@@ -352,10 +371,10 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               ),
             );
           } else {
-            setState(() => _statusMsg = 'Loaded! (GPU: $gpuProvider)');
+            setState(() => _statusMsg = 'Loaded! (GPU: $actualProvider)');
             showBubble(
               Text(
-                "Loaded! (GPU: $gpuProvider)",
+                "Loaded! (GPU: $actualProvider)",
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 14,
@@ -390,7 +409,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           Icon(Ionicons.hardware_chip_sharp, size: 42, color: cs.primary),
           const SizedBox(height: 8),
           Text(
-            "Runtime Manager",
+            "runtime manager",
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 22,
@@ -416,9 +435,11 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           else ...[
             _buildSpecsCard(cs),
             const SizedBox(height: 16),
-            _buildTierCards(cs),
+            _buildRuntimeCards(cs),
             const SizedBox(height: 14),
             _buildModelStatus(cs),
+            const SizedBox(height: 14),
+            _buildTierCards(cs),
             const SizedBox(height: 14),
             _buildActions(cs),
             const SizedBox(height: 10),
@@ -484,6 +505,140 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: children,
+      ),
+    );
+  }
+
+  Widget _buildRuntimeCards(ColorScheme cs) {
+    final providers = OrtEnv.instance.availableProviders();
+    final supportedList = <(OrtProvider, String, bool)>[
+      (.cuda, 'CUDA', providers.contains(OrtProvider.cuda)),
+      (.nvTensorRtRtx, 'TENSORRT', providers.contains(OrtProvider.tensorrt) || providers.contains(OrtProvider.nvTensorRtRtx)),
+      (.xnnpack, 'XNNPACK', providers.contains(OrtProvider.xnnpack)),
+      (.dnnl, 'DNNL', providers.contains(OrtProvider.dnnl)),
+    ];
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withAlpha(100),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: .start,
+        children: [
+          Text("GPU Provider", style: _sectionTitle(cs)),
+          Text(
+            "auto picks the best available, or tap to override",
+            style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+          ),
+          const SizedBox(height: 8),
+          GestureDetector(
+            onTap: () => _setProvider('auto'),
+            child: _providerCard(
+              cs,
+              icon: Ionicons.speedometer,
+              label: 'AUTO',
+              subtitle: _specs?.recommendedGpuProvider ?? 'CPU',
+              selected: _selectedProvider == 'auto',
+            ),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: supportedList.map((p) {
+              return GestureDetector(
+                onTap: p.$3 ? () => _setProvider(p.$2) : null,
+                child: _providerCard(
+                  cs,
+                  icon: p.$3
+                      ? Ionicons.hardware_chip_sharp
+                      : Ionicons.hardware_chip_outline,
+                  label: p.$1.name.toUpperCase(),
+                  subtitle: null,
+                  selected: _selectedProvider == p.$2,
+                  supported: p.$3,
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 6),
+          _providerCard(
+            cs,
+            icon: Ionicons.hardware_chip_outline,
+            label: 'CPU',
+            subtitle: 'always available',
+            selected: _selectedProvider == 'CPU',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _providerCard(
+    ColorScheme cs, {
+    required IconData icon,
+    required String label,
+    String? subtitle,
+    required bool selected,
+    bool supported = true,
+  }) {
+    return Container(
+      width: double.infinity,
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: selected
+            ? cs.primary.withAlpha(25)
+            : cs.surfaceContainerHighest.withAlpha(60),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: selected ? cs.primary : Colors.transparent,
+          width: 1.5,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            size: 16,
+            color: selected
+                ? cs.primary
+                : supported
+                    ? cs.onSurface
+                    : cs.onSurface.withAlpha(100),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontFamily: 'Syne',
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
+              color: selected
+                  ? cs.primary
+                  : supported
+                      ? cs.onSurface
+                      : cs.onSurface.withAlpha(100),
+            ),
+          ),
+          if (subtitle != null) ...[
+            const SizedBox(width: 6),
+            Text(
+              subtitle,
+              style: TextStyle(
+                fontSize: 10,
+                fontFamily: 'Hack',
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ],
+          const Spacer(),
+          if (selected)
+            Icon(Icons.radio_button_checked, size: 14, color: cs.primary)
+          else if (supported)
+            Icon(Icons.radio_button_off, size: 14, color: cs.onSurfaceVariant),
+        ],
       ),
     );
   }
@@ -574,14 +729,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
                         color: sel ? cs.primary : cs.onSurfaceVariant,
                       ),
                       const SizedBox(width: 6),
-                      Text(
-                        meta['label'] as String,
-                        style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          fontSize: 14,
-                          color: sel ? cs.primary : cs.onSurface,
-                        ),
-                      ),
+                      Text(meta['label'] as String, style: _sectionTitle(cs)),
                       const Spacer(),
                       _statusIcon(cnt, files.length, cs),
                     ],
@@ -592,13 +740,7 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
                     style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant),
                   ),
                   const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      _usageChip(cs, Icons.memory, 'VRAM ${meta['vram']}'),
-                      const SizedBox(width: 4),
-                      _usageChip(cs, Icons.storage, 'RAM ${meta['ram']}'),
-                    ],
-                  ),
+                  _usageChip(cs, Icons.storage, 'RAM ${meta['ram']}'),
                 ],
               ),
             ),
@@ -656,12 +798,8 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           Row(
             children: [
               Text(
-                'Models  ·  ${_tier.toUpperCase()}',
-                style: TextStyle(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 13,
-                  color: cs.onSurface,
-                ),
+                'Models  ·  ${_tier.toLowerCase()}',
+                style: _sectionTitle(cs),
               ),
               const Spacer(),
               Text(
@@ -749,47 +887,43 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
           cs.primary,
         ),
         const SizedBox(height: 10),
-        GestureDetector(
-          onTap: _busy ? null : _uploadZip,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOut,
-            decoration: BoxDecoration(
-              color: _dragHoveringZip
-                  ? cs.primary.withValues(alpha: 0.08)
-                  : cs.surfaceContainerHighest.withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: DottedBorder(
-              options: RoundedRectDottedBorderOptions(
-                radius: const Radius.circular(10),
+        DropTarget(
+          onDragEntered: (_) {
+            if (!_busy) setState(() => _dragHoveringZip = true);
+          },
+          onDragExited: (_) {
+            if (_dragHoveringZip) setState(() => _dragHoveringZip = false);
+          },
+          onDragDone: (details) async {
+            setState(() => _dragHoveringZip = false);
+            final f = details.files.firstOrNull;
+            if (f == null || !f.name.endsWith('.zip')) return;
+            final bytes = await f.readAsBytes();
+            await _uploadZip(bytes: bytes);
+          },
+          child: GestureDetector(
+            onTap: _busy ? null : () => _uploadZip(),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              decoration: BoxDecoration(
                 color: _dragHoveringZip
-                    ? cs.primary
-                    : cs.onSurfaceVariant.withValues(alpha: 0.45),
-                strokeWidth: 1.5,
-                dashPattern: const [6, 3],
+                    ? cs.primary.withValues(alpha: 0.08)
+                    : cs.surfaceContainerHighest.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(10),
               ),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                child: DropTarget(
-                  onDragEntered: (_) {
-                    if (!_busy) {
-                      setState(() => _dragHoveringZip = true);
-                    }
-                  },
-                  onDragExited: (_) {
-                    if (_dragHoveringZip) {
-                      setState(() => _dragHoveringZip = false);
-                    }
-                  },
-                  onDragDone: (details) async {
-                    setState(() => _dragHoveringZip = false);
-                    final f = details.files.firstOrNull;
-                    if (f == null || !f.name.endsWith('.zip')) return;
-                    final bytes = await f.readAsBytes();
-                    await _uploadZip(bytes: bytes);
-                  },
+              child: DottedBorder(
+                options: RoundedRectDottedBorderOptions(
+                  radius: const Radius.circular(10),
+                  color: _dragHoveringZip
+                      ? cs.primary
+                      : cs.onSurfaceVariant.withValues(alpha: 0.45),
+                  strokeWidth: 1.5,
+                  dashPattern: const [6, 3],
+                ),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
                   child: Column(
                     children: [
                       Icon(

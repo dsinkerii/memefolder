@@ -127,7 +127,7 @@ class CaptionService {
 
       // resize to h=48, maintaining aspect ratio
       final targetH = 48;
-      final targetW = ((cropW * targetH) / cropH).ceil().clamp(1, 2048);
+      final targetW = ((cropW * targetH) / cropH).ceil().clamp(1, 1024);
 
       // bilinear resize from original rgba
       final recFloat = Float32List(3 * targetH * targetW);

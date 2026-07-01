@@ -69,6 +69,8 @@ final List<({String tag, Color color, String label})> _allTags = [
 
   (tag: '@imagecontent', color: Color(0xFF9436A6), label: 'mode'),
   (tag: '@audiocontent', color: Color(0xFF9436A6), label: 'mode'),
+  (tag: '@ocr', color: Color(0xFF9436A6), label: 'mode'),
+  (tag: '@transcript', color: Color(0xFF9436A6), label: 'mode'),
 ];
 
 final List<({String tag, Color color, String label})> _allOperators = [
@@ -379,13 +381,7 @@ class _ContextBarFieldState extends State<_ContextBarField> {
               },
             ),
           ),
-          style: newInputStyle(context).copyWith(
-            fontFamily: "Syne",
-            fontVariations: [
-              FontVariation('wdth', 2800),
-              FontVariation('wght', 600),
-            ],
-          ),
+          style: newInputStyle(context),
           controller: widget.controller,
           focusNode: _focusNode,
           onTapOutside: (_) => _focusNode.unfocus(),
@@ -447,7 +443,7 @@ List<Token> tokenize(String text) {
     r'|(&)' // 5. and
     r'|(\|)' // 6. or
     r'|(@\.[a-zA-Z0-9]{2,4}(?=\s|$|[&|!()]))' // 7. extension
-    r'|(@(?:audiocontent|imagecontent))' // 7b. content mode toggles
+    r'|(@(?:audiocontent|imagecontent|ocr|transcript))' // 7b. content mode toggles
     r'|(@(?:video|gif|picture|image|photo|audio|sound))' // 8. filetype
     r'|(@date(?:[<>=]=?)[^\s@&|!()]+)' // 9. date logical
     r'|(@date\?[0-9]{4}(?:[\d.]*))' // 9b. date format: @date?YYYY, @date?MM.YYYY, @date?DD.MM.YYYY
@@ -481,7 +477,7 @@ List<Token> tokenize(String text) {
     } else if (match.group(7) != null) {
       type = TokTagFileext();
     } else if (match.group(8) != null) {
-      type = TokTagLogical();
+      type = TokTagMode();
     } else if (match.group(9) != null) {
       type = TokTagFiletype();
     } else if (match.group(10) != null || match.group(11) != null) {
@@ -557,6 +553,11 @@ class TokTagLogical extends TokenType {
 }
 
 class TokTagCustom extends TokenType {
+  @override
+  final TextStyle style = _underlined(Color(0xFF9436A6));
+}
+
+class TokTagMode extends TokenType {
   @override
   final TextStyle style = _underlined(Color(0xFF9436A6));
 }

@@ -47,3 +47,41 @@ program fl studio @image @score>50
 ``` 
 
 semantic search for "program fl studio", filter images only, min score 50.
+
+# TROUBLESHOOTING
+
+### - the app uses CPU only!
+
+memefolder uses [onnxruntime_v2](https://pub.dev/packages/onnxruntime_v2) as it's backend for models, refer to the troubleshooting from there:
+
+Windows (NVIDIA):
+
+- Install [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+- Optional: [TensorRT](https://developer.nvidia.com/tensorrt) for extra speed
+
+Windows (Any GPU):
+
+ - DirectML works out-of-the-box on Windows 10+
+
+Linux (NVIDIA):
+
+- Install CUDA runtime: `apt install nvidia-cuda-toolkit`
+- Optional: TensorRT
+
+Linux (AMD):
+
+ - Install [ROCm](https://www.amd.com/en/products/software/rocm.html)
+
+hint: easiest win is to install TensorRT on any platform, as CUDA is a pain in the ahh during troubleshooting
+
+# PERSONAL BENCHMARK
+
+indexing (w/ Samsung 990 Pro 2tb):
+- memes folder contains 2939 files, 23.8 Gb total, 2261 of which are videos&gifs (rest are images)
+- 2939 files indexed in 5 minutes
+
+running this on an Intel Core i5-9600KF (no acceleration):
+- 40 files embedded in 20 minutes (so full would take >12 hours)
+
+running this on an RTX 3060
+- bad

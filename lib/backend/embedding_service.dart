@@ -68,9 +68,12 @@ class EmbeddingService {
 
   Future<SendPort> _spawnIsolate() async {
     final receivePort = ReceivePort();
+    debugPrint('[embedding] Isolate.spawn: creating embedding isolate...');
     _isolate = await Isolate.spawn(embeddingIsolateMain, receivePort.sendPort);
+    debugPrint('[embedding] Isolate.spawn: waiting for SendPort...');
     final sendPort = await receivePort.first as SendPort;
     _isolateSendPort = sendPort;
+    debugPrint('[embedding] Isolate.spawn: got SendPort');
     return sendPort;
   }
 
@@ -98,17 +101,33 @@ class EmbeddingService {
     final base = modelsPath ?? await _resolveModelsPath();
     _modelsBasePath = base;
     _modelsPath = tier != null ? p.join(base, tier) : base;
+    debugPrint('[embedding] ═══ SERVICE INIT ═══');
     debugPrint('[embedding] models path: $_modelsPath');
+    debugPrint('[embedding] requested gpuProvider: $gpuProvider');
+    debugPrint('[embedding] tier: $tier');
 
+    debugPrint('[embedding] spawning isolate...');
     await _spawnIsolate();
-    final result = await _sendToIsolate<List>([0, _modelsPath, gpuProvider, tier]);
-    clipDim = result[0] as int;
-    _gpuInitError = result[1] as String?;
-    _gpuProvider = (_gpuInitError != null) ? 'CPU' : (gpuProvider ?? 'CPU');
+    debugPrint('[embedding] isolate spawned, sending init message...');
+
+    try {
+      final result = await _sendToIsolate<List>([0, _modelsPath, gpuProvider, tier]);
+      clipDim = result[0] as int;
+      _gpuInitError = result[1] as String?;
+      final activeProvider = result.length > 2 ? result[2] as String? : null;
+      _gpuProvider = (_gpuInitError != null) ? 'CPU' : (activeProvider ?? gpuProvider ?? 'CPU');
+
+      debugPrint('[embedding] isolate replied: clipDim=$clipDim activeProvider=$activeProvider gpuInitError=$_gpuInitError');
+      debugPrint('[embedding] final gpuProvider=$_gpuProvider');
+    } catch (e) {
+      debugPrint('[embedding] CRASH during isolate init: $e');
+      rethrow;
+    }
 
     _lastGpuProvider = gpuProvider;
     _initialized = true;
     _touchIdleTimer();
+    debugPrint('[embedding] ═══ SERVICE INIT DONE ═══');
   }
 
   Future<Float32List> embedAudio(Float32List pcm48kHz) async {
@@ -140,9 +159,12 @@ class EmbeddingService {
       targetHeight: 224,
     );
     final frame = await codec.getNextFrame();
-    final bitmap = await frame.image.toByteData(
+    final image = frame.image;
+    final bitmap = await image.toByteData(
       format: ui.ImageByteFormat.rawRgba,
     );
+    image.dispose();
+    codec.dispose();
     if (bitmap == null) throw Exception('Failed to decode image');
 
     final pixels = bitmap.buffer.asUint8List();

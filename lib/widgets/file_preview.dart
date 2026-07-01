@@ -2146,7 +2146,7 @@ class _EmbeddingsSectionState extends State<_EmbeddingsSection> {
                     color: cs.surfaceContainerHighest.withAlpha(120),
                     borderRadius: BorderRadius.circular(4),
                   ),
-                  child: Text(
+                  child: SelectableText(
                     content,
                     style: TextStyle(
                       fontSize: 10,

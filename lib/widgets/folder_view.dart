@@ -14,6 +14,7 @@ import 'package:memefolder/helpers/styled_inputfields.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/utils/binary_paths.dart';
 import 'package:memefolder/widgets/file_badges.dart';
+import 'package:memefolder/widgets/morphing_index_fab.dart';
 import 'package:path/path.dart' as p;
 import 'package:silky_scroll/silky_scroll.dart';
 
@@ -67,16 +68,13 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   bool _thumbnailQueueCancelled = false;
   ValueNotifier<bool> isReindexing = ValueNotifier(false);
   ValueNotifier<double> indexProgress = ValueNotifier(0.0);
+  ValueNotifier<String> indexProgressText = ValueNotifier('');
   CancellationToken? _cancelToken;
 
   List<FileSystemEntity> _loadedEntities = [];
   bool _isLoadingEntities = true;
-  bool _hasMoreEntities = false;
   int _totalEntityCount = 0;
   StreamSubscription<FileSystemEntity>? _dirSub;
-  static const int _batchSize = 200;
-
-  ScrollController? _lastController;
 
   List<String> _suggestions = [];
   int _selectedSuggestionIndex = -1;
@@ -94,7 +92,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   void dispose() {
     FilterService.instance.removeListener(_onFilterChanged);
     _dirSub?.cancel();
-    _lastController?.removeListener(_onScroll);
     _thumbnailQueueCancelled = true;
     while (_thumbnailWaiters.isNotEmpty) {
       _thumbnailWaiters.removeFirst().complete();
@@ -110,8 +107,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
 
   Future<void> _loadData() async {
     _dirSub?.cancel();
-    _lastController?.removeListener(_onScroll);
-    _lastController = null;
     _thumbnailQueueCancelled = true;
     while (_thumbnailWaiters.isNotEmpty) {
       _thumbnailWaiters.removeFirst().complete();
@@ -120,7 +115,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     _thumbnailQueueCancelled = false;
     _loadedEntities = [];
     _isLoadingEntities = true;
-    _hasMoreEntities = false;
     if (mounted) setState(() {});
 
     final isActive = FilterService.instance.isActive;
@@ -139,7 +133,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 .where((e) => !p.basename(e.path).startsWith('.'))
                 .toList();
             _isLoadingEntities = false;
-            _hasMoreEntities = false;
           });
         }
       } else {
@@ -152,40 +145,31 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
   }
 
   void _loadDirectoryData() {
-    _loadedEntities = [];
+    final collected = <FileSystemEntity>[];
     _totalEntityCount = 0;
-    int batchCount = 0;
     _isLoadingEntities = true;
-    _hasMoreEntities = true;
     _countTotalEntities(widget.currentPath);
 
     _dirSub = Directory(widget.currentPath).list().listen(
       (entity) {
         if (p.basename(entity.path).startsWith('.')) return;
-        _loadedEntities.add(entity);
-        batchCount++;
-
-        if (batchCount >= _batchSize) {
-          _dirSub?.pause();
-          batchCount = 0;
-          _sortLoadedEntities();
-          if (mounted) setState(() => _isLoadingEntities = false);
-        }
+        collected.add(entity);
       },
       onDone: () {
+        _loadedEntities = collected;
         _sortLoadedEntities();
         if (mounted) {
           setState(() {
             _isLoadingEntities = false;
-            _hasMoreEntities = false;
           });
         }
       },
       onError: (_) {
+        _loadedEntities = collected;
+        _sortLoadedEntities();
         if (mounted) {
           setState(() {
             _isLoadingEntities = false;
-            _hasMoreEntities = false;
           });
         }
       },
@@ -200,14 +184,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
       }
     } catch (_) {}
     if (mounted) setState(() => _totalEntityCount = count);
-  }
-
-  void _loadMoreEntities() {
-    if (_hasMoreEntities && !_isLoadingEntities) {
-      _isLoadingEntities = true;
-      if (mounted) setState(() {});
-      _dirSub?.resume();
-    }
   }
 
   void _sortLoadedEntities() {
@@ -249,24 +225,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
         ],
       ),
     );
-  }
-
-  void _ensureScrollListener(ScrollController controller) {
-    if (_lastController != controller) {
-      _lastController?.removeListener(_onScroll);
-      _lastController = controller;
-      controller.addListener(_onScroll);
-    }
-  }
-
-  void _onScroll() {
-    final controller = _lastController;
-    if (controller == null || !controller.hasClients) return;
-    if (!_hasMoreEntities || _isLoadingEntities) return;
-    if (controller.position.pixels >=
-        controller.position.maxScrollExtent - 500) {
-      _loadMoreEntities();
-    }
   }
 
   @override
@@ -520,7 +478,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           future: _indexedFilesFuture,
           builder: (context, indexedSnapshot) => SilkyScroll(
             builder: (context, controller, physics, pointerDeviceKind) {
-              _ensureScrollListener(controller);
 
               if (_isLoadingEntities && _loadedEntities.isEmpty) {
                 return const Center(child: CircularProgressIndicator());
@@ -628,91 +585,39 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           ),
         ),
       ),
-      floatingActionButton: Tooltip(
-        message: 'Re-index current folder',
-        child: IconButton(
-          style: ButtonStyle(
-            backgroundColor: WidgetStatePropertyAll(cs.primary),
-            padding: WidgetStatePropertyAll(EdgeInsets.all(16)),
-          ),
-          hoverColor: cs.primaryContainer,
-          onPressed: isReindexing.value
-              ? () {
-                  _cancelToken?.cancel();
-                }
-              : () async {
-                  _cancelToken = CancellationToken();
-                  isReindexing.value = true;
-                  indexProgress.value = 0;
-                  await indexDirectory(
-                    widget.currentPath,
-                    onProgress: (p) => indexProgress.value = p,
-                    cancelToken: _cancelToken,
-                  );
-                  _indexedFilesFuture = getIndexedFiles(widget.currentPath);
-                  _loadDirectoryData();
-                  indexProgress.value = 0;
-                  isReindexing.value = false;
-                },
-          icon: ValueListenableBuilder(
-            valueListenable: isReindexing,
-            builder: (context, value, child) => AnimatedSwitcher(
-              duration: Duration(milliseconds: 500),
-              child: isReindexing.value
-                  ? ValueListenableBuilder<double>(
-                      key: const ValueKey("loading"),
-                      valueListenable: indexProgress,
-                      builder: (context, progress, _) {
-                        return SizedBox(
-                          height: 36,
-                          width: 36,
-                          child: Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              SizedBox(
-                                height: 36,
-                                width: 36,
-                                child: CircularProgressIndicator(
-                                  value: progress > 0 ? progress : null,
-                                  color: readableOn(
-                                    Theme.of(context).colorScheme.primary,
-                                  ),
-                                  strokeWidth: 3,
-                                ),
-                              ),
-                              Icon(
-                                Icons.close,
-                                size: 16,
-                                color: readableOn(
-                                  Theme.of(context).colorScheme.primary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    )
-                  : Row(
-                      key: const ValueKey("idle"),
-                      mainAxisSize: MainAxisSize.min,
-                      spacing: 10,
-                      children: [
-                        Icon(
-                          Icons.refresh,
-                          color: readableOn(cs.primary),
-                          size: 26,
-                        ),
-                        Text(
-                          "index",
-                          maxLines: 1,
-                          style: TextStyle(
-                            color: readableOn(cs.primary),
-                            fontSize: 18,
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                      ],
-                    ),
+      floatingActionButton: ValueListenableBuilder<bool>(
+        valueListenable: isReindexing,
+        builder: (context, reindexing, _) => ValueListenableBuilder<double>(
+          valueListenable: indexProgress,
+          builder: (context, progress, _) => ValueListenableBuilder<String>(
+            valueListenable: indexProgressText,
+            builder: (context, progressText, _) => MorphingIndexFab(
+              isReindexing: reindexing,
+              indexProgress: progress,
+              indexProgressText: progressText,
+              onCancel: () {
+                _cancelToken?.cancel();
+              },
+              onRun: (options) async {
+                _cancelToken = CancellationToken();
+                isReindexing.value = true;
+                indexProgress.value = 0;
+                indexProgressText.value = 'indexing...';
+                await indexDirectory(
+                  widget.currentPath,
+                  onProgress: (text, p) {
+                    indexProgress.value = p;
+                    indexProgressText.value = text;
+                  },
+                  cancelToken: _cancelToken,
+                  options: options,
+                );
+                _indexedFilesFuture = getIndexedFiles(widget.currentPath);
+                _loadDirectoryData();
+                indexProgress.value = 0;
+                indexProgressText.value = '';
+                isReindexing.value = false;
+              },
             ),
           ),
         ),
@@ -838,9 +743,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     required double iconSize,
   }) {
     final fs = FilterService.instance;
-    //final score = fs.scores[entity.path];
-    final clipScore = fs.clipScores[entity.path];
-    final clapScore = fs.clapScores[entity.path];
+    final score = fs.scores[entity.path];
+    final space = fs.searchSpace;
 
     if (isDir) {
       return ShaderMask(
@@ -888,8 +792,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     final badges = <Widget>[];
     if (isFailed) badges.add(const _FailedBadge());
     if (isIndexed && !isFailed) badges.add(const IndexedBadge());
-    if (clipScore != null || clapScore != null) {
-      badges.add(_DualScoreBadge(clip: clipScore, clap: clapScore));
+    if (score != null) {
+      badges.add(_ScoreBadge(score: score, label: space.label));
     }
 
     if (badges.isNotEmpty) {
@@ -927,6 +831,7 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     try {
       final result = await Process.run(ffmpegPath, [
         '-y',
+        '-hwaccel', 'auto',
         '-ss',
         '00:00:01',
         '-i',
@@ -1149,10 +1054,10 @@ class _FailedBadge extends StatelessWidget {
   }
 }
 
-class _DualScoreBadge extends StatelessWidget {
-  final double? clip;
-  final double? clap;
-  const _DualScoreBadge({this.clip, this.clap});
+class _ScoreBadge extends StatelessWidget {
+  final double score;
+  final String label;
+  const _ScoreBadge({required this.score, this.label = ''});
 
   Color _scoreColor(ColorScheme cs, double score) {
     if (score < 50) return cs.error;
@@ -1163,13 +1068,11 @@ class _DualScoreBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final scores = [?clip, ?clap].whereType<double>().toList();
-    if (scores.isEmpty) return const SizedBox.shrink();
-    final best = scores.reduce((a, b) => a > b ? a : b);
+    final display = label.isEmpty ? '${score.round()}%' : '$label ${score.round()}%';
     return Positioned(
       top: 2,
       left: 2,
-      child: _Chip(label: '${best.round()}%', color: _scoreColor(cs, best)),
+      child: _Chip(label: display, color: _scoreColor(cs, score)),
     );
   }
 }

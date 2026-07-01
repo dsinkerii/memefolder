@@ -22,101 +22,92 @@ double _cosineSimilarity(Float32List a, Float32List b) {
   return dot / (sqrt(na) * sqrt(nb));
 }
 
+enum SearchSpace { ultimate, siglip, ocr, transcript, clap }
+
+extension SearchSpaceExt on SearchSpace {
+  String get label => switch (this) {
+    SearchSpace.ultimate => '',
+    SearchSpace.siglip => 'img',
+    SearchSpace.ocr => 'txt',
+    SearchSpace.transcript => 'cc',
+    SearchSpace.clap => 'aud',
+  };
+}
+
 List<Map<String, Object?>> _computeScoresInIsolate(
   Map<String, Object?> params,
 ) {
-  final queryClip = params['queryClip'] as Float32List?;
+  final filePaths = params['filePaths'] as List<String>;
+  final statuses = params['statuses'] as List<String>;
+  final isClapMode = params['isClapMode'] as bool;
+  final rawTexts = params['rawTexts'] as List<String?>?;
+  final queryWords = params['queryWords'] as List<String>?;
+
+  // Fuzzy text matching mode: used for @ocr / @transcript search
+  if (rawTexts != null && queryWords != null && queryWords.isNotEmpty) {
+    return _computeFuzzyScores(filePaths, statuses, rawTexts, queryWords);
+  }
+
+  // Cosine similarity mode: used for all other semantic search
+  final queryEmb = params['queryEmb'] as Float32List?;
   final queryClap = params['queryClap'] as Float32List?;
   final clipDim = params['clipDim'] as int;
   final clapDim = params['clapDim'] as int;
   final cd4 = clipDim * 4;
   final ad4 = clapDim * 4;
-  final filePaths = params['filePaths'] as List<String>;
-  final statuses = params['statuses'] as List<String>;
-  final clipBlobs = params['clipBlobs'] as List<Uint8List?>;
+  final searchBlobs = params['searchBlobs'] as List<Uint8List?>;
   final clapBlobs = params['clapBlobs'] as List<Uint8List?>;
-  final ocrBlobs = params['ocrBlobs'] as List<Uint8List?>;
-  final transcriptBlobs = params['transcriptBlobs'] as List<Uint8List?>;
-
-  if (queryClip != null) {
-    // debug: check query embedding stats
-    double qsum = 0, qsumsq = 0;
-    for (int i = 0; i < clipDim; i++) { qsum += queryClip[i]; qsumsq += queryClip[i] * queryClip[i]; }
-    // ignore: avoid_print
-    print('[score] queryClip dim=$clipDim first5=${queryClip[0].toStringAsFixed(4)},${queryClip[1].toStringAsFixed(4)},${queryClip[2].toStringAsFixed(4)},${queryClip[3].toStringAsFixed(4)},${queryClip[4].toStringAsFixed(4)} mean=${(qsum/clipDim).toStringAsFixed(4)} norm=${sqrt(qsumsq).toStringAsFixed(4)}');
-  }
-
-  int clipOk = 0, clipBad = 0, clapOk = 0, clapBad = 0;
-  double minCs = 1.0, maxCs = -1.0;
 
   final results = <Map<String, Object?>>[];
   for (int i = 0; i < filePaths.length; i++) {
-    final absPath = filePaths[i];
-    final status = statuses[i];
+    double? score;
 
-    double? clipScore;
-    double? clapScore;
-    double bestScore = 0.0;
-
-    if (queryClip != null && clipBlobs[i] != null) {
-      final blob = clipBlobs[i]!;
+    if (!isClapMode && queryEmb != null && searchBlobs[i] != null) {
+      final blob = searchBlobs[i]!;
       if (blob.length == cd4) {
-        clipOk++;
         final emb = Float32List.view(blob.buffer, 0, clipDim);
-        clipScore = _cosineSimilarity(queryClip, emb);
-        if (clipScore > maxCs) maxCs = clipScore;
-        if (clipScore < minCs) minCs = clipScore;
-        if (clipScore > bestScore) bestScore = clipScore;
-      } else {
-        clipBad++;
+        score = _cosineSimilarity(queryEmb, emb);
       }
     }
 
-    if (queryClap != null && clapBlobs[i] != null) {
+    if (isClapMode && queryClap != null && clapBlobs[i] != null) {
       final blob = clapBlobs[i]!;
       if (blob.length == ad4) {
-        clapOk++;
         final emb = Float32List.view(blob.buffer, 0, clapDim);
-        clapScore = _cosineSimilarity(queryClap, emb);
-        if (clapScore > bestScore) bestScore = clapScore;
-      } else {
-        clapBad++;
+        score = _cosineSimilarity(queryClap, emb);
       }
     }
 
-    if (queryClip != null && ocrBlobs[i] != null) {
-      final blob = ocrBlobs[i]!;
-      if (blob.length == cd4) {
-        final emb = Float32List.view(blob.buffer, 0, clipDim);
-        final score = _cosineSimilarity(queryClip, emb);
-        if (score > bestScore) bestScore = score;
-      }
-    }
-    if (queryClip != null && transcriptBlobs[i] != null) {
-      final blob = transcriptBlobs[i]!;
-      if (blob.length == cd4) {
-        final emb = Float32List.view(blob.buffer, 0, clipDim);
-        final score = _cosineSimilarity(queryClip, emb);
-        if (score > bestScore) bestScore = score;
-      }
+    if (statuses[i] == 'embed_failed') score = -1;
+
+    results.add({'path': filePaths[i], 'score': score});
+  }
+  return results;
+}
+
+List<Map<String, Object?>> _computeFuzzyScores(
+  List<String> filePaths,
+  List<String> statuses,
+  List<String?> rawTexts,
+  List<String> queryWords,
+) {
+  final results = <Map<String, Object?>>[];
+  for (int i = 0; i < filePaths.length; i++) {
+    final text = rawTexts[i]?.toLowerCase() ?? '';
+    if (text.isEmpty || statuses[i] == 'embed_failed') {
+      results.add({'path': filePaths[i], 'score': -1.0});
+      continue;
     }
 
-    if (status == 'embed_failed') bestScore = -1;
+    var matched = 0;
+    for (final word in queryWords) {
+      if (text.contains(word)) matched++;
+    }
 
     results.add({
-      'path': absPath,
-      'clipScore': clipScore,
-      'clapScore': clapScore,
-      'bestScore': bestScore,
+      'path': filePaths[i],
+      'score': matched / queryWords.length,
     });
-  }
-  if (queryClip != null) {
-    // ignore: avoid_print
-    print('[score] clipBlobs: ok=$clipOk badDim=$clipBad scoreRange=${minCs.toStringAsFixed(4)}..${maxCs.toStringAsFixed(4)}');
-  }
-  if (queryClap != null) {
-    // ignore: avoid_print
-    print('[score] clapBlobs: ok=$clapOk badDim=$clapBad');
   }
   return results;
 }
@@ -317,7 +308,8 @@ class _Parser {
         tok.type is TokTagFileext ||
         tok.type is TokTagFolder ||
         tok.type is TokTagLogical ||
-        tok.type is TokTagModality) {
+        tok.type is TokTagModality ||
+        tok.type is TokTagMode) {
       _pos++;
       return _tokenToFilter(tok);
     }
@@ -337,6 +329,7 @@ FilterExpr? parseFilterExpression(String query) {
         ty is TokTagFolder ||
         ty is TokTagLogical ||
         ty is TokTagModality ||
+        ty is TokTagMode ||
         ty is TokOpAnd ||
         ty is TokOpOr ||
         ty is TokOpNot ||
@@ -390,12 +383,9 @@ class FilterService extends ChangeNotifier {
   FilterExpr? _expression;
   String _semanticText = '';
   Map<String, double> _scores = {};
-  Map<String, double?> _clipScores = {};
-  Map<String, double?> _clapScores = {};
   double? _minScore;
   double? _maxScore;
-  bool _clipMode = true;
-  bool _clapMode = false;
+  SearchSpace _searchSpace = SearchSpace.ultimate;
 
   String get query => _query;
   FilterExpr? get expression => _expression;
@@ -403,10 +393,7 @@ class FilterService extends ChangeNotifier {
   bool get isActive => _query.trim().isNotEmpty;
   bool get hasSemantic => _semanticText.isNotEmpty;
   Map<String, double> get scores => _scores;
-  Map<String, double?> get clipScores => _clipScores;
-  Map<String, double?> get clapScores => _clapScores;
-  bool get clipMode => _clipMode;
-  bool get clapMode => _clapMode;
+  SearchSpace get searchSpace => _searchSpace;
 
   void setQuery(String query) {
     if (_query == query) return;
@@ -420,11 +407,8 @@ class FilterService extends ChangeNotifier {
   void clear() {
     setQuery('');
     _scores = {};
-    _clipScores = {};
-    _clapScores = {};
   }
 
-  /// Parse @score>N or @score<N or @score=N from query
   void _extractScoreConstraints() {
     _minScore = null;
     _maxScore = null;
@@ -443,18 +427,21 @@ class FilterService extends ChangeNotifier {
     }
   }
 
-  /// Extract plain text (non-tag) tokens for semantic search.
-  /// Also parses @audiocontent / @imagecontent mode toggles.
+  /// Extract plain text tokens for semantic search.
+  /// Detects search space: @imagecontent, @ocr, @transcript, @audiocontent.
+  /// Default is ultimate (search_emb).
   void _extractSemanticText() {
-    _clipMode = true;
-    _clapMode = false;
+    _searchSpace = SearchSpace.ultimate;
     final q = _query.toLowerCase();
     if (q.contains('@audiocontent')) {
-      _clapMode = true;
-      _clipMode = false;
+      _searchSpace = SearchSpace.clap;
+    } else if (q.contains('@imagecontent')) {
+      _searchSpace = SearchSpace.siglip;
+    } else if (q.contains('@ocr')) {
+      _searchSpace = SearchSpace.ocr;
+    } else if (q.contains('@transcript')) {
+      _searchSpace = SearchSpace.transcript;
     }
-    if (q.contains('@imagecontent')) _clipMode = true;
-    if (!_clipMode && !_clapMode) _clipMode = true; // fallback
 
     final tokens = tokenize(_query);
     final parts = <String>[];
@@ -535,7 +522,9 @@ class FilterService extends ChangeNotifier {
     if (_expression != null && _semanticText.isNotEmpty) {
       final semanticSet = semanticPaths.toSet();
       _scores.removeWhere((k, _) => !semanticSet.contains(k));
-      final intersection = tagPaths.where((p) => semanticSet.contains(p)).toSet();
+      final intersection = tagPaths
+          .where((p) => semanticSet.contains(p))
+          .toSet();
       final sorted = intersection.toList()
         ..sort((a, b) => (_scores[b] ?? 0).compareTo(_scores[a] ?? 0));
       return sorted;
@@ -550,99 +539,85 @@ class FilterService extends ChangeNotifier {
 
   Future<List<String>> _executeSemantic(String rootPath) async {
     _scores = {};
-    _clipScores = {};
-    _clapScores = {};
 
     final svc = EmbeddingService.instance;
-    Float32List? queryClip;
-    if (_clipMode) {
-      final clipTok = HuggingFaceTokenizer.fromFile(
-        p.join(svc.modelsPath!, 'clip', 'tokenizer.json'),
-      );
-      final clipIds = clipTok.encodeClip(_semanticText);
-      queryClip = await svc.embedClipText(clipIds);
-    }
+    final isClapMode = _searchSpace == SearchSpace.clap;
+    final useFuzzy = _searchSpace == SearchSpace.ocr;
+
+    // Embed query text (skip for fuzzy mode — not needed)
+    Float32List? queryEmb;
     Float32List? queryClap;
-    if (_clapMode) {
-      final clapTokPath = p.join(svc.modelsPath!, 'clap', 'tokenizer.json');
-      if (!File(clapTokPath).existsSync()) {
-        stderr.writeln('[memefolder] CLAP models not available for this tier, falling back to CLIP');
-        _clapMode = false;
-        _clipMode = true;
-      } else {
-        final clapTok = HuggingFaceTokenizer.fromFile(clapTokPath);
-        final clapIds = clapTok.encodeClap(_semanticText);
-        queryClap = await svc.embedClapText(clapIds);
+    if (!useFuzzy) {
+      if (isClapMode) {
+        final clapTokPath = p.join(svc.modelsPath!, 'clap', 'tokenizer.json');
+        if (!File(clapTokPath).existsSync()) {
+          stderr.writeln('[filter] CLAP models not available, falling back to ultimate');
+          _searchSpace = SearchSpace.ultimate;
+        } else {
+          final clapTok = HuggingFaceTokenizer.fromFile(clapTokPath);
+          final clapIds = clapTok.encodeClap(_semanticText);
+          queryClap = await svc.embedClapText(clapIds);
+        }
+      }
+      if (!isClapMode || _searchSpace == SearchSpace.ultimate) {
+        final clipTok = HuggingFaceTokenizer.fromFile(
+          p.join(svc.modelsPath!, 'clip', 'tokenizer.json'),
+        );
+        final clipIds = clipTok.encodeClip(_semanticText);
+        queryEmb = await svc.embedClipText(clipIds);
       }
     }
 
-    // Scan DB for files with embeddings
+    // Determine which column to fetch based on search space
+    final String embColumn;
+    switch (_searchSpace) {
+      case SearchSpace.ultimate:
+        embColumn = 'search_emb';
+      case SearchSpace.siglip:
+        embColumn = 'clip_emb';
+      case SearchSpace.ocr:
+        embColumn = 'ocr_emb';
+      case SearchSpace.transcript:
+        embColumn = 'transcript_emb';
+      case SearchSpace.clap:
+        embColumn = 'clap_emb';
+    }
+
     final dbPath = p.join(rootPath, '.memefolder.db');
     if (!File(dbPath).existsSync()) return [];
 
     final db = await openDatabase(dbPath, readOnly: true);
 
     try {
-      // warn if DB tier != current model tier
-      try {
-        final rows = await db.rawQuery(
-          'SELECT model_tier FROM roots WHERE id = 1',
-        );
-        if (rows.isNotEmpty) {
-          final dbTier = rows.first['model_tier'] as String? ?? 'lite';
-          final currentTier = PlayerPrefs.getString('model_tier', 'lite');
-          if (dbTier != currentTier) {
-            showBubble(
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.warning_amber_rounded),
-                  const SizedBox(width: 12),
-                  Flexible(
-                    child: Text(
-                      'Embeddings built with "$dbTier" model, current is "$currentTier" -- re-index for best results',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w500,
-                        decoration: TextDecoration.none,
-                      ),
-                      softWrap: true,
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }
-        }
-      } catch (_) {
-        // old schema without model_tier column - ignore
-      }
+      // Determine media types to query
       final mediaWhere = <String>[];
-      if (_clipMode) {
-        mediaWhere.addAll(['image', 'video']);
-      }
-      if (_clapMode) {
+      if (isClapMode) {
         mediaWhere.addAll(['audio', 'video']);
+      } else {
+        mediaWhere.addAll(['image', 'video', 'audio']);
       }
       final mediaList = mediaWhere.toSet().toList();
       final placeholders = mediaList.map((_) => '?').join(',');
+
+      // When fuzzy matching, JOIN file_text to get raw OCR text
+      final join = useFuzzy ? 'LEFT JOIN file_text ft ON f.id = ft.file_id' : '';
+      final textSelect = useFuzzy ? ', ft.ocr_text AS raw_text' : '';
+
       final rows = await db.rawQuery('''
-        SELECT id, rel_path, clip_emb, clap_emb, metadata_emb,
-               ocr_emb, transcript_emb, status
-        FROM files
-        WHERE media_type IN ($placeholders)
+        SELECT f.id, f.rel_path, f.$embColumn, f.clap_emb, f.status$textSelect
+        FROM files f
+        $join
+        WHERE f.media_type IN ($placeholders)
       ''', mediaList);
 
-      final cd = EmbeddingService.instance.clipDim;
-      final ad = EmbeddingService.instance.clapDim;
+      final cd = svc.clipDim;
+      final ad = svc.clapDim;
 
       final filePaths = <String>[];
       final statuses = <String>[];
-      final clipBlobs = <Uint8List?>[];
+      final searchBlobs = <Uint8List?>[];
       final clapBlobs = <Uint8List?>[];
-      final ocrBlobs = <Uint8List?>[];
-      final transcriptBlobs = <Uint8List?>[];
+      final rawTexts = <String?>[];
       final seen = <String>{};
 
       for (final row in rows) {
@@ -650,35 +625,36 @@ class FilterService extends ChangeNotifier {
         if (!seen.add(path)) continue;
         filePaths.add(path);
         statuses.add(row['status'] as String? ?? '');
-        clipBlobs.add(row['clip_emb'] as Uint8List?);
+        searchBlobs.add(row[embColumn] as Uint8List?);
         clapBlobs.add(row['clap_emb'] as Uint8List?);
-        ocrBlobs.add(row['ocr_emb'] as Uint8List?);
-        transcriptBlobs.add(row['transcript_emb'] as Uint8List?);
+        if (useFuzzy) rawTexts.add(row['raw_text'] as String?);
       }
 
+      // Split query into lowercase words for fuzzy matching
+      final queryWords = useFuzzy
+          ? _semanticText.toLowerCase().split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList()
+          : null;
+
       final params = <String, Object?>{
-        'queryClip': queryClip,
+        'queryEmb': queryEmb,
         'queryClap': queryClap,
         'clipDim': cd,
         'clapDim': ad,
         'filePaths': filePaths,
         'statuses': statuses,
-        'clipBlobs': clipBlobs,
+        'searchBlobs': searchBlobs,
         'clapBlobs': clapBlobs,
-        'ocrBlobs': ocrBlobs,
-        'transcriptBlobs': transcriptBlobs,
+        'isClapMode': isClapMode,
+        'rawTexts': useFuzzy ? rawTexts : null,
+        'queryWords': queryWords,
       };
 
       final results = await compute(_computeScoresInIsolate, params);
 
       for (final r in results) {
         final absPath = r['path'] as String;
-        final clipScore = r['clipScore'] as double?;
-        final clapScore = r['clapScore'] as double?;
-        final bestScore = r['bestScore'] as double;
-        _clipScores[absPath] = clipScore;
-        _clapScores[absPath] = clapScore;
-        _scores[absPath] = bestScore;
+        final score = r['score'] as double?;
+        if (score != null) _scores[absPath] = score;
       }
     } finally {
       await db.close();
@@ -686,36 +662,24 @@ class FilterService extends ChangeNotifier {
 
     if (_scores.isEmpty) return [];
 
-    // min-max normalize each score map to [0, 100]
-    void normalizeMap(Map<String, double?> map, String label) {
-      final keys = map.keys
-          .where((k) => map[k] != null && _scores[k]! >= 0)
-          .toList();
-      if (keys.length > 1) {
-        double minV = map[keys[0]]!, maxV = map[keys[0]]!;
-        for (final k in keys) {
-          final v = map[k]!;
-          if (v < minV) minV = v;
-          if (v > maxV) maxV = v;
-        }
-        final range = maxV - minV;
-        debugPrint('[score] $label: ${keys.length} entries min=$minV max=$maxV range=$range');
-        for (final k in keys) {
-          map[k] = range > 0 ? ((map[k]! - minV) / range) * 100.0 : 100.0;
-        }
-      } else if (keys.length == 1) {
-        debugPrint('[score] $label: single entry, setting 100');
-        map[keys[0]] = 100.0;
-      } else {
-        debugPrint('[score] $label: no valid entries');
+    // min-max normalize _scores to [0, 100]
+    final keys = _scores.keys.where((k) => _scores[k]! >= 0).toList();
+    if (keys.length > 1) {
+      double minV = _scores[keys[0]]!, maxV = _scores[keys[0]]!;
+      for (final k in keys) {
+        final v = _scores[k]!;
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
       }
+      final range = maxV - minV;
+      for (final k in keys) {
+        _scores[k] = range > 0 ? ((_scores[k]! - minV) / range) * 100.0 : 100.0;
+      }
+    } else if (keys.length == 1) {
+      _scores[keys[0]] = 100.0;
     }
 
-    normalizeMap(_scores.cast<String, double?>(), 'best');
-    normalizeMap(_clipScores, 'clip');
-    normalizeMap(_clapScores, 'clap');
-
-    // Sort descending by best score, put failed at end
+    // sort descending by score, put failed at end
     final sorted = _scores.entries.toList()
       ..sort((a, b) {
         if (a.value < 0 && b.value < 0) return 0;
@@ -724,7 +688,6 @@ class FilterService extends ChangeNotifier {
         return b.value.compareTo(a.value);
       });
 
-    debugPrint('[filter] semantic: ${sorted.length} results');
     return sorted.map((e) => e.key).toList();
   }
 }

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui';
 import 'package:just_audio/just_audio.dart';
@@ -17,6 +18,7 @@ import 'caption_service.dart';
 import 'embedding_service.dart';
 import 'mel_ffi.dart';
 import 'tokenizer.dart';
+import 'package:memefolder/widgets/morphing_index_fab.dart';
 
 final _player = AudioPlayer();
 final _warnplayer = AudioPlayer();
@@ -42,9 +44,11 @@ class IndexResult {
 
 Future<IndexResult> indexDirectory(
   String currentPath, {
-  void Function(double progress)? onProgress,
+  void Function(String text, double progress)? onProgress,
   CancellationToken? cancelToken,
+  IndexOptions? options,
 }) async {
+  options ??= IndexOptions.load();
   final dbPath = p.join(currentPath, '.memefolder.db');
   final tmpPath = '$dbPath.tmp';
   final dbExists = File(dbPath).existsSync();
@@ -69,13 +73,14 @@ Future<IndexResult> indexDirectory(
     ),
   );
 
-  onProgress?.call(0);
+  onProgress?.call('indexing...', 0);
   stderr.writeln(
     '[memefolder] indexDirectory: start path=$currentPath dbExists=$dbExists',
   );
 
   try {
     final totalCount = await _countFiles(currentPath);
+    onProgress?.call('indexing 0/$totalCount', 0);
 
     await _initDB(currentPath, dbPath: tmpPath);
     final result = await _scanAndIndex(
@@ -84,6 +89,7 @@ Future<IndexResult> indexDirectory(
       totalCount: totalCount,
       onProgress: onProgress,
       cancelToken: cancelToken,
+      options: options,
     );
 
     if (cancelToken?.isCancelled ?? false) {
@@ -116,7 +122,7 @@ Future<IndexResult> indexDirectory(
     }
     await File(tmpPath).rename(dbPath);
 
-    onProgress?.call(1.0);
+    onProgress?.call('done', 1.0);
 
     showBubble(
       Row(
@@ -162,7 +168,7 @@ Future<void> _cleanupTmp(String tmpPath) async {
 Future<void> _initDB(String currentPath, {required String dbPath}) async {
   final db = await openDatabase(
     dbPath,
-    version: 2,
+    version: 3,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON;');
       await db.execute('PRAGMA journal_mode = WAL;');
@@ -172,7 +178,6 @@ Future<void> _initDB(String currentPath, {required String dbPath}) async {
     },
     onUpgrade: (db, oldVersion, newVersion) async {
       if (oldVersion < 2) {
-        // dedup files with same rel_path, keep lowest id, then add unique index
         await db.execute('''
           DELETE FROM files WHERE id NOT IN (
             SELECT MIN(id) FROM files GROUP BY rel_path
@@ -182,6 +187,11 @@ Future<void> _initDB(String currentPath, {required String dbPath}) async {
           CREATE UNIQUE INDEX IF NOT EXISTS idx_files_rel_path_unique
           ON files(rel_path)
         ''');
+      }
+      if (oldVersion < 3) {
+        await db.execute(
+          'ALTER TABLE files ADD COLUMN search_emb BLOB',
+        );
       }
     },
   );
@@ -396,13 +406,41 @@ Future<IndexResult> _scanAndIndex(
   String rootPath, {
   required String dbPath,
   int totalCount = 0,
-  void Function(double progress)? onProgress,
+  void Function(String text, double progress)? onProgress,
   CancellationToken? cancelToken,
+  IndexOptions? options,
 }) async {
+  options ??= IndexOptions.load();
+  final opts = options;
   final db = await openDatabase(dbPath);
   stderr.writeln(
     '[memefolder] _scanAndIndex: start rootPath=$rootPath totalCount=$totalCount',
   );
+
+  // load already indexed files if onlyUnprocessed is true
+  final Set<String> alreadyIndexed = {};
+  if (opts.onlyUnprocessed) {
+    try {
+      final oldDbPath = p.join(rootPath, '.memefolder.db');
+      if (File(oldDbPath).existsSync()) {
+        final oldDb = await openDatabase(oldDbPath, singleInstance: false);
+        final results = await oldDb.rawQuery(
+          "SELECT rel_path FROM files WHERE media_type IN ('image','video','audio') AND status != 'embed_failed'",
+        );
+        await oldDb.close();
+        for (final r in results) {
+          alreadyIndexed.add(r['rel_path'] as String);
+        }
+        stderr.writeln(
+          '[memefolder] onlyUnprocessed: ${alreadyIndexed.length} already indexed files',
+        );
+      }
+    } catch (e) {
+      stderr.writeln(
+        '[memefolder] onlyUnprocessed: failed to load indexed files: $e',
+      );
+    }
+  }
 
   var indexedCount = 0;
   var embedOk = 0;
@@ -611,7 +649,7 @@ Future<IndexResult> _scanAndIndex(
 
           indexedCount++;
           if (totalCount > 0) {
-            onProgress?.call(indexedCount / totalCount);
+            onProgress?.call('indexing $indexedCount/$totalCount', indexedCount / totalCount);
           }
 
           if (relPath.isNotEmpty) {
@@ -665,15 +703,18 @@ Future<IndexResult> _scanAndIndex(
             await attachTag(txn, fileId, tagId, 'system');
           }
 
-          embedQueue.add(
-            _EmbedJob(
-              fileId: fileId,
-              absPath: entity.path,
-              mediaType: mediaType,
-              audioMeta: audioMeta,
-              fileName: stem,
-            ),
-          );
+          // Skip embedding if onlyUnprocessed and file already indexed
+          if (!opts.onlyUnprocessed || !alreadyIndexed.contains(fileRel)) {
+            embedQueue.add(
+              _EmbedJob(
+                fileId: fileId,
+                absPath: entity.path,
+                mediaType: mediaType,
+                audioMeta: audioMeta,
+                fileName: stem,
+              ),
+            );
+          }
         }
       } catch (_) {}
     }
@@ -689,6 +730,7 @@ Future<IndexResult> _scanAndIndex(
 
   if (embedQueue.isNotEmpty) {
     if (!EmbeddingService.instance.isInitialized) {
+      onProgress?.call('loading', -1);
       await _autoInitEmbedding();
       final specs = await SystemSpecs.detect();
       final gpuProvider = specs.recommendedGpuProvider;
@@ -742,6 +784,7 @@ Future<IndexResult> _scanAndIndex(
         embedQueue,
         onProgress,
         cancelToken,
+        options: options,
       );
       embedOk += ok;
       embedFail += fail;
@@ -887,7 +930,8 @@ Future<void> _createSchema(Database db, String currentPath) async {
       metadata_emb BLOB,
       metadata_text TEXT,
       ocr_emb BLOB,
-      transcript_emb BLOB
+      transcript_emb BLOB,
+      search_emb BLOB
     );
   ''');
 
@@ -1272,9 +1316,12 @@ class _EmbedJob {
 Future<(int, int)> _processEmbedQueue(
   String dbPath,
   List<_EmbedJob> queue,
-  void Function(double progress)? onProgress,
-  CancellationToken? cancelToken,
-) async {
+  void Function(String text, double progress)? onProgress,
+  CancellationToken? cancelToken, {
+  IndexOptions? options,
+}) async {
+  options ??= IndexOptions.load();
+  final opts = options;
   final svc = EmbeddingService.instance;
   stderr.writeln('[memefolder] _processEmbedQueue: queueSize=${queue.length}');
   final tokenizer = HuggingFaceTokenizer.fromFile(
@@ -1287,12 +1334,13 @@ Future<(int, int)> _processEmbedQueue(
   // initialize caption service for mid/full tiers
   if (isMidOrFull && !CaptionService.instance.isInitialized) {
     try {
+      final captionGpu = EmbeddingService.instance.gpuProvider;
       await CaptionService.instance.initialize(
         modelsPath: svc.modelsPath!,
-        gpuProvider: 'CPU',
+        gpuProvider: captionGpu,
       );
       stderr.writeln(
-        '[memefolder] caption service initialized (CPU) modelsPath=${svc.modelsPath}',
+        '[memefolder] caption service initialized ($captionGpu) modelsPath=${svc.modelsPath}',
       );
     } catch (e) {
       stderr.writeln('[memefolder] caption service init failed: $e');
@@ -1315,7 +1363,14 @@ Future<(int, int)> _processEmbedQueue(
         '[memefolder] embedJob: fileId=${job.fileId} type=${job.mediaType} path=${job.absPath}',
       );
       try {
-        await _embedOneFile(db, svc, tokenizer, job, tier: currentTier);
+        await _embedOneFile(
+          db,
+          svc,
+          tokenizer,
+          job,
+          tier: currentTier,
+          options: opts,
+        );
         ok++;
       } catch (e) {
         fail++;
@@ -1332,7 +1387,7 @@ Future<(int, int)> _processEmbedQueue(
       }
       done++;
       if (queue.length > 1) {
-        onProgress?.call(done / queue.length);
+        onProgress?.call('embedding $done/${queue.length}', done / queue.length);
       }
     }
   } finally {
@@ -1347,22 +1402,27 @@ Future<void> _embedOneFile(
   HuggingFaceTokenizer tokenizer,
   _EmbedJob job, {
   String tier = 'lite',
+  IndexOptions? options,
 }) async {
+  options ??= IndexOptions.load();
+  final opts = options;
   final isMidOrFull = tier == 'mid' || tier == 'full';
   final isFull = tier == 'full';
   final updates = <String, Object?>{};
   final crashLog = CrashLogger.instance;
 
-  try {
-    final clipEmb = await _embedClipForFile(svc, tokenizer, job);
-    if (clipEmb != null && clipEmb.length == svc.clipDim) {
-      updates['clip_emb'] = clipEmb.buffer.asUint8List();
+  if (opts.enableClip) {
+    try {
+      final clipEmb = await _embedClipForFile(svc, tokenizer, job);
+      if (clipEmb != null && clipEmb.length == svc.clipDim) {
+        updates['clip_emb'] = clipEmb.buffer.asUint8List();
+      }
+    } catch (e) {
+      debugPrint('[embed] clip embedding failed for ${job.absPath}: $e');
     }
-  } catch (e) {
-    debugPrint('[embed] clip embedding failed for ${job.absPath}: $e');
   }
 
-  if (isFull) {
+  if (opts.enableClap && isFull) {
     try {
       final clapEmb = await _embedClapForFile(svc, job);
       if (clapEmb != null && clapEmb.length == svc.clapDim) {
@@ -1395,7 +1455,8 @@ Future<void> _embedOneFile(
   // ocr for images and video keyframes (mid/full)
   final captionReady = CaptionService.instance.isInitialized;
   String? ocrText;
-  if (isMidOrFull &&
+  if (opts.enableOcr &&
+      isMidOrFull &&
       captionReady &&
       (job.mediaType == 'image' || job.mediaType == 'video')) {
     try {
@@ -1407,6 +1468,7 @@ Future<void> _embedOneFile(
         final keyframePath = '${job.absPath}.ocr_keyframe.jpg';
         final result = await Process.run(ffmpegPath, [
           '-y',
+          '-hwaccel', 'auto',
           '-i',
           job.absPath,
           '-vframes',
@@ -1437,7 +1499,8 @@ Future<void> _embedOneFile(
 
   // whisper transcription for audio/video (mid/full)
   String? transcript;
-  if (isMidOrFull &&
+  if (opts.enableWhisper &&
+      isMidOrFull &&
       captionReady &&
       (job.mediaType == 'audio' || job.mediaType == 'video')) {
     try {
@@ -1478,11 +1541,77 @@ Future<void> _embedOneFile(
     updates['has_speech'] = 1;
   }
 
+  // compute search_emb: lerp(mean, elementwise_max, 0.6) of all available
+  // CLIP-space embeddings, then L2-normalize
+  {
+    final vectors = <Float32List>[];
+    final dim = svc.clipDim;
+    if (updates['clip_emb'] != null) {
+      vectors.add(Float32List.view(
+        (updates['clip_emb'] as Uint8List).buffer, 0, dim));
+    }
+    if (updates['metadata_emb'] != null) {
+      vectors.add(Float32List.view(
+        (updates['metadata_emb'] as Uint8List).buffer, 0, dim));
+    }
+    if (updates['ocr_emb'] != null) {
+      vectors.add(Float32List.view(
+        (updates['ocr_emb'] as Uint8List).buffer, 0, dim));
+    }
+    if (updates['transcript_emb'] != null) {
+      vectors.add(Float32List.view(
+        (updates['transcript_emb'] as Uint8List).buffer, 0, dim));
+    }
+    if (vectors.isNotEmpty) {
+      final searchEmb = _combineEmbeddings(vectors, dim);
+      updates['search_emb'] = searchEmb.buffer.asUint8List();
+    }
+  }
+
   crashLog.mark('embedOneFile:save', {'updateKeys': updates.keys.join(',')});
 
   if (updates.isNotEmpty) {
     await db.update('files', updates, where: 'id = ?', whereArgs: [job.fileId]);
   }
+}
+
+/// Combine multiple CLIP-space embeddings into a single search embedding.
+/// Uses lerp(mean, elementwise_max, 0.6) then L2-normalizes.
+Float32List _combineEmbeddings(List<Float32List> vectors, int dim) {
+  final n = vectors.length;
+  final meanVec = Float32List(dim);
+  final maxVec = Float32List(dim);
+
+  // copy first vector into both
+  meanVec.setAll(0, vectors[0]);
+  maxVec.setAll(0, vectors[0]);
+
+  // accumulate mean and elementwise max
+  for (int d = 0; d < dim; d++) {
+    for (int v = 1; v < n; v++) {
+      meanVec[d] += vectors[v][d];
+      if (vectors[v][d] > maxVec[d]) maxVec[d] = vectors[v][d];
+    }
+    meanVec[d] /= n;
+  }
+
+  // lerp: result = 0.4 * mean + 0.6 * max
+  final result = Float32List(dim);
+  double normSq = 0;
+  for (int d = 0; d < dim; d++) {
+    result[d] = 0.4 * meanVec[d] + 0.6 * maxVec[d];
+    normSq += result[d] * result[d];
+  }
+
+  // L2 normalize
+  if (normSq > 0) {
+    final invNorm = 1.0 / sqrt(normSq);
+    for (int d = 0; d < dim; d++) {
+      result[d] *= invNorm;
+    }
+  }
+
+  return result;
 }
 
 /// Compute CLIP text embedding for text/subtitle files.
@@ -1522,6 +1651,7 @@ Future<Float32List?> _embedClipForFile(
       stderr.writeln('[memefolder] ffmpeg keyframe: start path=${job.absPath}');
       final result = await Process.run(ffmpegPath, [
         '-y',
+        '-hwaccel', 'auto',
         '-i',
         job.absPath,
         '-vframes',
