@@ -63,7 +63,8 @@ const tierMeta = {
     'clip': '768d',
     'vram': '1.2 GB',
     'ram': '1.3 GB',
-    'remoteUrl': '',
+    'remoteUrl':
+        'https://github.com/dsinkerii/memefolder/releases/download/2.0.0/lite.zip',
   },
   'mid': {
     'label': 'Mid',
@@ -71,7 +72,8 @@ const tierMeta = {
     'clip': '768d',
     'vram': '1.9 GB',
     'ram': '1.6 GB',
-    'remoteUrl': '',
+    'remoteUrl':
+        'https://github.com/dsinkerii/memefolder/releases/download/2.0.0/mid.zip',
   },
   'full': {
     'label': 'Full',
@@ -79,7 +81,8 @@ const tierMeta = {
     'clip': '768d',
     'vram': '2.8 GB',
     'ram': '2 GB',
-    'remoteUrl': '',
+    'remoteUrl':
+        'https://github.com/dsinkerii/memefolder/releases/download/2.0.0/full.zip',
   },
 };
 
@@ -513,7 +516,12 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     final providers = OrtEnv.instance.availableProviders();
     final supportedList = <(OrtProvider, String, bool)>[
       (.cuda, 'CUDA', providers.contains(OrtProvider.cuda)),
-      (.nvTensorRtRtx, 'TENSORRT', providers.contains(OrtProvider.tensorrt) || providers.contains(OrtProvider.nvTensorRtRtx)),
+      (
+        .nvTensorRtRtx,
+        'TENSORRT',
+        providers.contains(OrtProvider.tensorrt) ||
+            providers.contains(OrtProvider.nvTensorRtRtx),
+      ),
       (.xnnpack, 'XNNPACK', providers.contains(OrtProvider.xnnpack)),
       (.dnnl, 'DNNL', providers.contains(OrtProvider.dnnl)),
     ];
@@ -605,8 +613,8 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
             color: selected
                 ? cs.primary
                 : supported
-                    ? cs.onSurface
-                    : cs.onSurface.withAlpha(100),
+                ? cs.onSurface
+                : cs.onSurface.withAlpha(100),
           ),
           const SizedBox(width: 8),
           Text(
@@ -618,8 +626,8 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
               color: selected
                   ? cs.primary
                   : supported
-                      ? cs.onSurface
-                      : cs.onSurface.withAlpha(100),
+                  ? cs.onSurface
+                  : cs.onSurface.withAlpha(100),
             ),
           ),
           if (subtitle != null) ...[
