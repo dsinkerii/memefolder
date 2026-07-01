@@ -641,7 +641,7 @@ class FilterService extends ChangeNotifier {
       final textSelect = useFuzzy ? ', ft.ocr_text AS raw_text' : '';
 
       final rows = await db.rawQuery('''
-        SELECT f.id, f.rel_path, f.$embColumn, f.clap_emb, f.status$textSelect
+        SELECT f.id, f.rel_path, f.status$textSelect
         FROM files f
         $join
         WHERE f.media_type IN ($placeholders)
@@ -652,19 +652,43 @@ class FilterService extends ChangeNotifier {
 
       final filePaths = <String>[];
       final statuses = <String>[];
-      final searchBlobs = <Uint8List?>[];
+      final embBlobs = <Uint8List?>[];
       final clapBlobs = <Uint8List?>[];
       final rawTexts = <String?>[];
       final seen = <String>{};
+      final rowIds = <int>[];
 
       for (final row in rows) {
         final path = p.join(rootPath, row['rel_path'] as String);
         if (!seen.add(path)) continue;
         filePaths.add(path);
         statuses.add(row['status'] as String? ?? '');
-        searchBlobs.add(row[embColumn] as Uint8List?);
-        clapBlobs.add(row['clap_emb'] as Uint8List?);
+        rowIds.add(row['id'] as int);
+        embBlobs.add(null);
+        clapBlobs.add(null);
         if (useFuzzy) rawTexts.add(row['raw_text'] as String?);
+      }
+
+      const batchSize = 500;
+      for (var offset = 0; offset < rowIds.length; offset += batchSize) {
+        final end = (offset + batchSize).clamp(0, rowIds.length);
+        final batchIds = rowIds.sublist(offset, end);
+        final placeholders2 = batchIds.map((_) => '?').join(',');
+        final embRows = await db.rawQuery(
+          'SELECT id, $embColumn, clap_emb FROM files WHERE id IN ($placeholders2)',
+          batchIds,
+        );
+        final byId = <int, Map<String, Object?>>{};
+        for (final r in embRows) {
+          byId[r['id'] as int] = r;
+        }
+        for (var i = offset; i < end; i++) {
+          final r = byId[rowIds[i]];
+          if (r != null) {
+            embBlobs[i] = r[embColumn] as Uint8List?;
+            clapBlobs[i] = r['clap_emb'] as Uint8List?;
+          }
+        }
       }
 
       // Split query into lowercase words for fuzzy matching
@@ -679,7 +703,7 @@ class FilterService extends ChangeNotifier {
         'clapDim': ad,
         'filePaths': filePaths,
         'statuses': statuses,
-        'searchBlobs': searchBlobs,
+        'searchBlobs': embBlobs,
         'clapBlobs': clapBlobs,
         'isClapMode': isClapMode,
         'rawTexts': useFuzzy ? rawTexts : null,

@@ -54,3 +54,9 @@ c_ffi/build/
 
 # onnxruntime gpu providers (build artifacts)
 **/ort_gpu_providers/
+
+# AppImage build artifacts
+*.AppImage
+linuxdeploy*
+appimage-builder*
+AppImageBuilder.yml

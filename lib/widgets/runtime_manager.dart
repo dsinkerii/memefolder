@@ -517,10 +517,9 @@ class _RuntimeManagerDialogState extends State<_RuntimeManagerDialog> {
     final supportedList = <(OrtProvider, String, bool)>[
       (.cuda, 'CUDA', providers.contains(OrtProvider.cuda)),
       (
-        .nvTensorRtRtx,
+        .tensorrt,
         'TENSORRT',
-        providers.contains(OrtProvider.tensorrt) ||
-            providers.contains(OrtProvider.nvTensorRtRtx),
+        providers.contains(OrtProvider.tensorrt),
       ),
       (.xnnpack, 'XNNPACK', providers.contains(OrtProvider.xnnpack)),
       (.dnnl, 'DNNL', providers.contains(OrtProvider.dnnl)),

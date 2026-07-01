@@ -730,6 +730,9 @@ Future<IndexResult> _scanAndIndex(
 
   if (embedQueue.isNotEmpty) {
     if (!EmbeddingService.instance.isInitialized) {
+      if (cancelToken?.isCancelled ?? false) {
+        return IndexResult(totalFiles: totalCount, indexedOk: 0, indexedFail: 0, skipped: 0);
+      }
       onProgress?.call('loading', -1);
       await _autoInitEmbedding();
       final specs = await SystemSpecs.detect();
@@ -1333,6 +1336,7 @@ Future<(int, int)> _processEmbedQueue(
   final isMidOrFull = currentTier == 'mid' || currentTier == 'full';
   // initialize caption service for mid/full tiers
   if (isMidOrFull && !CaptionService.instance.isInitialized) {
+    if (cancelToken?.isCancelled ?? false) return (0, 0);
     try {
       final captionGpu = EmbeddingService.instance.gpuProvider;
       await CaptionService.instance.initialize(
@@ -1370,6 +1374,7 @@ Future<(int, int)> _processEmbedQueue(
           job,
           tier: currentTier,
           options: opts,
+          cancelToken: cancelToken,
         );
         ok++;
       } catch (e) {
@@ -1403,6 +1408,7 @@ Future<void> _embedOneFile(
   _EmbedJob job, {
   String tier = 'lite',
   IndexOptions? options,
+  CancellationToken? cancelToken,
 }) async {
   options ??= IndexOptions.load();
   final opts = options;
@@ -1410,6 +1416,8 @@ Future<void> _embedOneFile(
   final isFull = tier == 'full';
   final updates = <String, Object?>{};
   final crashLog = CrashLogger.instance;
+
+  if (cancelToken?.isCancelled ?? false) return;
 
   if (opts.enableClip) {
     try {
@@ -1423,6 +1431,7 @@ Future<void> _embedOneFile(
   }
 
   if (opts.enableClap && isFull) {
+    if (cancelToken?.isCancelled ?? false) return;
     try {
       final clapEmb = await _embedClapForFile(svc, job);
       if (clapEmb != null && clapEmb.length == svc.clapDim) {
@@ -1433,6 +1442,8 @@ Future<void> _embedOneFile(
     }
   }
 
+  if (cancelToken?.isCancelled ?? false) return;
+
   try {
     final textEmb = await _embedTextForFile(svc, tokenizer, job);
     if (textEmb != null && textEmb.length == svc.clipDim) {
@@ -1441,6 +1452,8 @@ Future<void> _embedOneFile(
   } catch (e) {
     debugPrint('[embed] text embedding failed for ${job.absPath}: $e');
   }
+
+  if (cancelToken?.isCancelled ?? false) return;
 
   try {
     final metadataResult = await _embedMetadata(svc, tokenizer, job);
@@ -1451,6 +1464,8 @@ Future<void> _embedOneFile(
   } catch (e) {
     debugPrint('[embed] metadata embedding failed for ${job.absPath}: $e');
   }
+
+  if (cancelToken?.isCancelled ?? false) return;
 
   // ocr for images and video keyframes (mid/full)
   final captionReady = CaptionService.instance.isInitialized;
@@ -1496,6 +1511,8 @@ Future<void> _embedOneFile(
       stderr.writeln('[caption] OCR failed for ${job.absPath}: $e');
     }
   }
+
+  if (cancelToken?.isCancelled ?? false) return;
 
   // whisper transcription for audio/video (mid/full)
   String? transcript;

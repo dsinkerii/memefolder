@@ -121,19 +121,26 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     if (isActive) {
       final root = PlayerPrefs.getString("main_folder");
       if (root.isNotEmpty) {
-        final filter = FilterService.instance;
-        final paths = await filter.execute(root);
-        final scores = filter.scores;
-        final sorted = paths.toList()
-          ..sort((a, b) => (scores[b] ?? 0).compareTo(scores[a] ?? 0));
-        if (mounted) {
-          setState(() {
-            _loadedEntities = sorted
-                .map((p) => File(p))
-                .where((e) => !p.basename(e.path).startsWith('.'))
-                .toList();
-            _isLoadingEntities = false;
-          });
+        try {
+          final filter = FilterService.instance;
+          final paths = await filter.execute(root);
+          final scores = filter.scores;
+          final sorted = paths.toList()
+            ..sort((a, b) => (scores[b] ?? 0).compareTo(scores[a] ?? 0));
+          if (mounted) {
+            setState(() {
+              _loadedEntities = sorted
+                  .map((p) => File(p))
+                  .where((e) => !p.basename(e.path).startsWith('.'))
+                  .toList();
+              _isLoadingEntities = false;
+            });
+          }
+        } catch (e) {
+          debugPrint('[folder_view] search failed: $e');
+          if (mounted) {
+            setState(() => _isLoadingEntities = false);
+          }
         }
       } else {
         if (mounted) setState(() => _isLoadingEntities = false);
@@ -478,7 +485,6 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           future: _indexedFilesFuture,
           builder: (context, indexedSnapshot) => SilkyScroll(
             builder: (context, controller, physics, pointerDeviceKind) {
-
               if (_isLoadingEntities && _loadedEntities.isEmpty) {
                 return const Center(child: CircularProgressIndicator());
               }
@@ -594,38 +600,41 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
             builder: (context, progressText, _) {
               final tier = PlayerPrefs.getString('model_tier', 'lite');
               final vis = switch (tier) {
-                'lite' => {'unprocessed'},
-                'mid' => {'unprocessed', 'ocr', 'whisper'},
+                'lite' => {'unprocessed', 'clip'},
+                'mid' => {'unprocessed', 'clip', 'ocr', 'whisper'},
                 _ => null,
               };
               return MorphingIndexFab(
-              isReindexing: reindexing,
-              indexProgress: progress,
-              indexProgressText: progressText,
-              visibleToggles: vis,
-              onCancel: () {
-                _cancelToken?.cancel();
-              },
-              onRun: (options) async {
-                _cancelToken = CancellationToken();
-                isReindexing.value = true;
-                indexProgress.value = 0;
-                indexProgressText.value = 'indexing...';
-                await indexDirectory(
-                  widget.currentPath,
-                  onProgress: (text, p) {
-                    indexProgress.value = p;
-                    indexProgressText.value = text;
-                  },
-                  cancelToken: _cancelToken,
-                  options: options,
-                );
-                _indexedFilesFuture = getIndexedFiles(widget.currentPath);
-                _loadDirectoryData();
-                indexProgress.value = 0;
-                indexProgressText.value = '';
-                isReindexing.value = false;
-              },
+                isReindexing: reindexing,
+                indexProgress: progress,
+                indexProgressText: progressText,
+                visibleToggles: vis,
+                onCancel: () {
+                  _cancelToken?.cancel();
+                  isReindexing.value = false;
+                  indexProgress.value = 0;
+                  indexProgressText.value = '';
+                },
+                onRun: (options) async {
+                  _cancelToken = CancellationToken();
+                  isReindexing.value = true;
+                  indexProgress.value = 0;
+                  indexProgressText.value = 'indexing...';
+                  await indexDirectory(
+                    widget.currentPath,
+                    onProgress: (text, p) {
+                      indexProgress.value = p;
+                      indexProgressText.value = text;
+                    },
+                    cancelToken: _cancelToken,
+                    options: options,
+                  );
+                  _indexedFilesFuture = getIndexedFiles(widget.currentPath);
+                  _loadDirectoryData();
+                  indexProgress.value = 0;
+                  indexProgressText.value = '';
+                  isReindexing.value = false;
+                },
               );
             },
           ),
@@ -840,7 +849,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
     try {
       final result = await Process.run(ffmpegPath, [
         '-y',
-        '-hwaccel', 'auto',
+        '-hwaccel',
+        'auto',
         '-ss',
         '00:00:01',
         '-i',
@@ -1077,7 +1087,9 @@ class _ScoreBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final display = label.isEmpty ? '${score.round()}%' : '$label ${score.round()}%';
+    final display = label.isEmpty
+        ? '${score.round()}%'
+        : '$label ${score.round()}%';
     return Positioned(
       top: 2,
       left: 2,

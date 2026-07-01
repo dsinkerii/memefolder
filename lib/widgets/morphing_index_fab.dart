@@ -291,14 +291,46 @@ class _MorphingIndexFabState extends State<MorphingIndexFab> {
     final vis = widget.visibleToggles;
 
     final allToggles = [
-      ('unprocessed', Icons.filter_alt, 'Only unprocessed', _options.onlyUnprocessed, (bool v) => setState(() => _options.onlyUnprocessed = v)),
-      ('clip', Icons.image, 'Image context', _options.enableClip, (bool v) => setState(() => _options.enableClip = v)),
-      ('clap', Icons.music_note, 'Audio context', _options.enableClap, (bool v) => setState(() => _options.enableClap = v)),
-      ('ocr', Icons.text_fields, 'Image text', _options.enableOcr, (bool v) => setState(() => _options.enableOcr = v)),
-      ('whisper', Icons.mic, 'Audio text', _options.enableWhisper, (bool v) => setState(() => _options.enableWhisper = v)),
+      (
+        'unprocessed',
+        Icons.filter_alt,
+        'Only unprocessed',
+        _options.onlyUnprocessed,
+        (bool v) => setState(() => _options.onlyUnprocessed = v),
+      ),
+      (
+        'clip',
+        Icons.image,
+        'Image context',
+        _options.enableClip,
+        (bool v) => setState(() => _options.enableClip = v),
+      ),
+      (
+        'clap',
+        Icons.music_note,
+        'Audio context',
+        _options.enableClap,
+        (bool v) => setState(() => _options.enableClap = v),
+      ),
+      (
+        'ocr',
+        Icons.text_fields,
+        'Image text',
+        _options.enableOcr,
+        (bool v) => setState(() => _options.enableOcr = v),
+      ),
+      (
+        'whisper',
+        Icons.mic,
+        'Audio text',
+        _options.enableWhisper,
+        (bool v) => setState(() => _options.enableWhisper = v),
+      ),
     ];
 
-    final toggles = vis == null ? allToggles : allToggles.where((t) => vis.contains(t.$1)).toList();
+    final toggles = vis == null
+        ? allToggles
+        : allToggles.where((t) => vis.contains(t.$1)).toList();
 
     return Stack(
       alignment: Alignment.bottomRight,
@@ -315,7 +347,6 @@ class _MorphingIndexFabState extends State<MorphingIndexFab> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 for (var i = 0; i < toggles.length; i++) ...[
-                  if (i > 0) const Divider(height: 1),
                   _buildToggleRow(
                     context,
                     icon: toggles[i].$2,

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=memefolder
+Comment=Find that one specific meme by context/tags
+Exec=memefolder
+Icon=memefolder
+Categories=Utility;FileTools;Graphics;
+Terminal=false
+StartupNotify=true
