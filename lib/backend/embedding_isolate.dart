@@ -79,15 +79,15 @@ void embeddingIsolateMain(SendPort mainSendPort) {
             }
             try {
               if (wantTensorrt) {
-                if (availableProviders.contains(OrtProvider.tensorrt) || availableProviders.contains(OrtProvider.nvTensorRtRtx)) {
-                  debugPrint('[embedding]   appending NvTensorRtRtx...');
-                  options.appendNvTensorRtRtxProvider();
+                if (availableProviders.contains(OrtProvider.tensorrt)) {
+                  debugPrint('[embedding]   appending TensorRT...');
+                  options.appendTensorRTProvider();
                   activeProvider ??= 'TensorRT';
-                  debugPrint('[embedding]   NvTensorRtRtx appended OK');
+                  debugPrint('[embedding]   TensorRT appended OK');
                 }
               }
             } catch (e) {
-              debugPrint('[embedding]   NvTensorRtRtx append failed: $e');
+              debugPrint('[embedding]   TensorRT append failed: $e');
             }
             try {
               if (wantXnnpack && availableProviders.contains(OrtProvider.xnnpack)) {
@@ -160,8 +160,8 @@ void embeddingIsolateMain(SendPort mainSendPort) {
                 }
               } catch (_) {}
               try {
-                if (wantTensorrt && (availableProviders.contains(OrtProvider.tensorrt) || availableProviders.contains(OrtProvider.nvTensorRtRtx))) {
-                  clapOpts.appendNvTensorRtRtxProvider();
+                if (wantTensorrt && availableProviders.contains(OrtProvider.tensorrt)) {
+                  clapOpts.appendTensorRTProvider();
                 }
               } catch (_) {}
               try {

@@ -56,8 +56,8 @@ void captionIsolateMain(SendPort mainSendPort) {
               }
             } catch (_) {}
             try {
-              if (gpuUpper == 'TENSORRT' && (availableProviders.contains(OrtProvider.tensorrt) || availableProviders.contains(OrtProvider.nvTensorRtRtx))) {
-                options.appendNvTensorRtRtxProvider();
+              if (gpuUpper == 'TENSORRT' && availableProviders.contains(OrtProvider.tensorrt)) {
+                options.appendTensorRTProvider();
               }
             } catch (_) {}
           }
