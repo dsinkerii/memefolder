@@ -591,10 +591,18 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
           valueListenable: indexProgress,
           builder: (context, progress, _) => ValueListenableBuilder<String>(
             valueListenable: indexProgressText,
-            builder: (context, progressText, _) => MorphingIndexFab(
+            builder: (context, progressText, _) {
+              final tier = PlayerPrefs.getString('model_tier', 'lite');
+              final vis = switch (tier) {
+                'lite' => {'unprocessed'},
+                'mid' => {'unprocessed', 'ocr', 'whisper'},
+                _ => null,
+              };
+              return MorphingIndexFab(
               isReindexing: reindexing,
               indexProgress: progress,
               indexProgressText: progressText,
+              visibleToggles: vis,
               onCancel: () {
                 _cancelToken?.cancel();
               },
@@ -618,7 +626,8 @@ class _FileBrowserPaneState extends State<FileBrowserPane> {
                 indexProgressText.value = '';
                 isReindexing.value = false;
               },
-            ),
+              );
+            },
           ),
         ),
       ),

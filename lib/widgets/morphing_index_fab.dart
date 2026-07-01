@@ -47,6 +47,7 @@ class MorphingIndexFab extends StatefulWidget {
   final VoidCallback onCancel;
   final ValueChanged<IndexOptions> onRun;
   final VoidCallback? onClose;
+  final Set<String>? visibleToggles;
 
   const MorphingIndexFab({
     super.key,
@@ -56,6 +57,7 @@ class MorphingIndexFab extends StatefulWidget {
     required this.onCancel,
     required this.onRun,
     this.onClose,
+    this.visibleToggles,
   });
 
   @override
@@ -72,7 +74,8 @@ class _MorphingIndexFabState extends State<MorphingIndexFab> {
   bool _open = false;
   late IndexOptions _options;
 
-  double get _openHeight => 6 * _itemHeight + 16;
+  int get _visibleCount => widget.visibleToggles?.length ?? 5;
+  double get _openHeight => (_visibleCount + 1) * _itemHeight + 16;
 
   TextStyle get _buttonTextStyle => TextStyle(
     fontFamily: "Syne",
@@ -285,6 +288,17 @@ class _MorphingIndexFabState extends State<MorphingIndexFab> {
 
   Widget _buildMenu(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final vis = widget.visibleToggles;
+
+    final allToggles = [
+      ('unprocessed', Icons.filter_alt, 'Only unprocessed', _options.onlyUnprocessed, (bool v) => setState(() => _options.onlyUnprocessed = v)),
+      ('clip', Icons.image, 'Image context', _options.enableClip, (bool v) => setState(() => _options.enableClip = v)),
+      ('clap', Icons.music_note, 'Audio context', _options.enableClap, (bool v) => setState(() => _options.enableClap = v)),
+      ('ocr', Icons.text_fields, 'Image text', _options.enableOcr, (bool v) => setState(() => _options.enableOcr = v)),
+      ('whisper', Icons.mic, 'Audio text', _options.enableWhisper, (bool v) => setState(() => _options.enableWhisper = v)),
+    ];
+
+    final toggles = vis == null ? allToggles : allToggles.where((t) => vis.contains(t.$1)).toList();
 
     return Stack(
       alignment: Alignment.bottomRight,
@@ -300,43 +314,16 @@ class _MorphingIndexFabState extends State<MorphingIndexFab> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                _buildToggleRow(
-                  context,
-                  icon: Icons.filter_alt,
-                  label: 'Only unprocessed',
-                  value: _options.onlyUnprocessed,
-                  onChanged: (v) =>
-                      setState(() => _options.onlyUnprocessed = v),
-                ),
-                const Divider(height: 1),
-                _buildToggleRow(
-                  context,
-                  icon: Icons.image,
-                  label: 'Image context',
-                  value: _options.enableClip,
-                  onChanged: (v) => setState(() => _options.enableClip = v),
-                ),
-                _buildToggleRow(
-                  context,
-                  icon: Icons.music_note,
-                  label: 'Audio context',
-                  value: _options.enableClap,
-                  onChanged: (v) => setState(() => _options.enableClap = v),
-                ),
-                _buildToggleRow(
-                  context,
-                  icon: Icons.text_fields,
-                  label: 'Image text',
-                  value: _options.enableOcr,
-                  onChanged: (v) => setState(() => _options.enableOcr = v),
-                ),
-                _buildToggleRow(
-                  context,
-                  icon: Icons.mic,
-                  label: 'Audio text',
-                  value: _options.enableWhisper,
-                  onChanged: (v) => setState(() => _options.enableWhisper = v),
-                ),
+                for (var i = 0; i < toggles.length; i++) ...[
+                  if (i > 0) const Divider(height: 1),
+                  _buildToggleRow(
+                    context,
+                    icon: toggles[i].$2,
+                    label: toggles[i].$3,
+                    value: toggles[i].$4,
+                    onChanged: toggles[i].$5,
+                  ),
+                ],
               ],
             ),
           ),

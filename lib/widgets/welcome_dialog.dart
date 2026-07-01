@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -18,6 +19,7 @@ import 'package:memefolder/config/theme.dart';
 import 'package:memefolder/helpers/new_dialog.dart';
 import 'package:memefolder/prefs.dart';
 import 'package:memefolder/widgets/file_badges.dart';
+import 'package:memefolder/widgets/morphing_index_fab.dart';
 import 'package:memefolder/widgets/smart_context_bar.dart';
 import 'package:confetti/confetti.dart';
 
@@ -31,7 +33,7 @@ void showWelcomeDialog(BuildContext context) {
   showScaleDialog(
     context: context,
     width: 600,
-    maxHeight: 450,
+    maxHeight: 600,
     barrierDismissible: false,
     builder: (dialogCtx) => _TutorialDialog(
       onFinish: () {
@@ -179,6 +181,8 @@ class _TutorialDialogState extends State<_TutorialDialog> {
   // slide 2
   bool _isIndexing = false;
   bool _indexed = false;
+  double _fakeProgress = 0;
+  String _fakeProgressText = '';
 
   // slide 3
   String _tier = 'lite';
@@ -607,80 +611,67 @@ class _TutorialDialogState extends State<_TutorialDialog> {
   }
 
   Widget _buildIndexButton(ColorScheme cs) {
-    return Tooltip(
-      message: 'Re-index current folder',
-      child: IconButton(
-        style: ButtonStyle(
-          backgroundColor: WidgetStatePropertyAll(cs.primary),
-          padding: WidgetStatePropertyAll(const EdgeInsets.all(16)),
-        ),
-        onPressed: _isIndexing
-            ? null
-            : () {
-                if (!_indexed) _startFakeIndex();
-              },
-        icon: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 500),
-          child: _isIndexing
-              ? SizedBox(
-                  key: const ValueKey("loading"),
-                  height: 36,
-                  width: 36,
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      SizedBox(
-                        height: 36,
-                        width: 36,
-                        child: CircularProgressIndicator(
-                          color: readableOn(cs.primary),
-                          strokeWidth: 3,
-                        ),
-                      ),
-                      Icon(
-                        Icons.close,
-                        size: 16,
-                        color: readableOn(cs.primary),
-                      ),
-                    ],
-                  ),
-                )
-              : Row(
-                  key: const ValueKey("idle"),
-                  mainAxisSize: MainAxisSize.min,
-                  spacing: 10,
-                  children: [
-                    Icon(
-                      Icons.refresh,
-                      color: readableOn(cs.primary),
-                      size: 26,
-                    ),
-                    Text(
-                      "index",
-                      maxLines: 1,
-                      style: TextStyle(
-                        color: readableOn(cs.primary),
-                        fontSize: 18,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                  ],
-                ),
-        ),
-      ),
+    return MorphingIndexFab(
+      isReindexing: _isIndexing,
+      indexProgress: _fakeProgress,
+      indexProgressText: _fakeProgressText,
+      visibleToggles: const {'unprocessed', 'clip', 'clap'},
+      onCancel: () {
+        if (_isIndexing) {
+          setState(() {
+            _isIndexing = false;
+            _fakeProgress = 0;
+            _fakeProgressText = '';
+          });
+        }
+      },
+      onRun: (options) {
+        if (!_indexed) _startFakeIndex();
+      },
     );
   }
 
   void _startFakeIndex() {
-    setState(() => _isIndexing = true);
-    Future.delayed(const Duration(seconds: 5), () {
-      if (mounted) {
-        setState(() {
-          _isIndexing = false;
-          _indexed = true;
-        });
-      }
+    setState(() {
+      _isIndexing = true;
+      _fakeProgress = 0;
+      _fakeProgressText = 'scanning files...';
     });
+    // simulate multi-step indexing with progress updates
+    final steps = [
+      (0.15, 'scanning files...'),
+      (0.30, 'indexing 1/5...'),
+      (0.433, 'embedding 1/5...'),
+      (0.682, 'embedding 2/5...'),
+      (0.792, 'embedding 3/5...'),
+      (0.921, 'embedding 4/5...'),
+    ];
+    var i = 0;
+    void tick() {
+      if (!mounted || i >= steps.length) {
+        if (mounted) {
+          setState(() {
+            _isIndexing = false;
+            _indexed = true;
+            _fakeProgress = 0;
+            _fakeProgressText = '';
+          });
+        }
+        return;
+      }
+      Future.delayed(Duration(milliseconds: Random().nextInt(300) + 500), () {
+        if (mounted) {
+          setState(() {
+            _fakeProgress = steps[i].$1;
+            _fakeProgressText = steps[i].$2;
+          });
+          i++;
+          tick();
+        }
+      });
+    }
+
+    tick();
   }
 
   Widget _buildSlide3() {
@@ -713,7 +704,7 @@ class _TutorialDialogState extends State<_TutorialDialog> {
             const SizedBox(height: 2),
             Text(
               'i recommend the ${_tierRecommendation == 'lite' ? 'lite' : 'full'} tier '
-                  'for you.',
+              'for you.',
               style: TextStyle(
                 fontSize: 11,
                 color: cs.primary,
@@ -1056,7 +1047,13 @@ class _TutorialDialogState extends State<_TutorialDialog> {
       final firstParts = firstFile.name.split('/');
       final stripTop =
           firstParts.length > 2 &&
-          ['clip', 'clap', 'ocr', 'whisper', 'manifest.yaml'].contains(firstParts[1]);
+          [
+            'clip',
+            'clap',
+            'ocr',
+            'whisper',
+            'manifest.yaml',
+          ].contains(firstParts[1]);
 
       for (final entry in archive) {
         if (entry.isFile) {
@@ -1125,10 +1122,10 @@ class _TutorialDialogState extends State<_TutorialDialog> {
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: 92),
           Image(
             image: ExactAssetImage("Assets/Images/AntumbraHappy.png"),
-            height: 192,
+            height: 256,
           ),
         ],
       ),

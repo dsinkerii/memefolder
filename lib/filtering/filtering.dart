@@ -91,6 +91,10 @@ List<Map<String, Object?>> _computeFuzzyScores(
   List<String?> rawTexts,
   List<String> queryWords,
 ) {
+  // Rejoin query words — OCR text has no spaces, so word-level matching is
+  // unreliable.  Use character-level scoring for continuous results.
+  final query = queryWords.join(' ').toLowerCase();
+
   final results = <Map<String, Object?>>[];
   for (int i = 0; i < filePaths.length; i++) {
     final text = rawTexts[i]?.toLowerCase() ?? '';
@@ -99,17 +103,50 @@ List<Map<String, Object?>> _computeFuzzyScores(
       continue;
     }
 
-    var matched = 0;
-    for (final word in queryWords) {
-      if (text.contains(word)) matched++;
+    // Take the best score across the full text and a sliding window.
+    // Full-text LCS handles substring matches; the window handles
+    // near-matches where the query is close to but not exactly in the text.
+    var best = _lcsRatio(query, text);
+    final qLen = query.length;
+    final winSize = qLen + (qLen ~/ 2) + 2; // ~1.5x query length + tolerance
+    if (text.length > winSize) {
+      for (int start = 0; start <= text.length - qLen; start++) {
+        final end = (start + winSize).clamp(0, text.length);
+        final w = _lcsRatio(query, text.substring(start, end));
+        if (w > best) best = w;
+      }
     }
-
-    results.add({
-      'path': filePaths[i],
-      'score': matched / queryWords.length,
-    });
+    results.add({'path': filePaths[i], 'score': best});
   }
   return results;
+}
+
+/// Longest Common Subsequence ratio: LCS(query, text) / len(query).
+/// Returns value in [0, 1]. Handles insertions, deletions, and swaps.
+double _lcsRatio(String query, String text) {
+  if (query.isEmpty || text.isEmpty) return 0;
+  final m = query.length, n = text.length;
+  // Optimized: only keep two rows at a time (O(min(m,n)) space)
+  if (m > n) {
+    // Swap to use less memory — LCS is symmetric
+    return _lcsRatio(text, query);
+  }
+  var prev = List<int>.filled(m + 1, 0);
+  var curr = List<int>.filled(m + 1, 0);
+  for (int j = 1; j <= n; j++) {
+    for (int i = 1; i <= m; i++) {
+      if (query[i - 1] == text[j - 1]) {
+        curr[i] = prev[i - 1] + 1;
+      } else {
+        curr[i] = prev[i] > curr[i - 1] ? prev[i] : curr[i - 1];
+      }
+    }
+    final tmp = prev;
+    prev = curr;
+    curr = tmp;
+    curr.fillRange(0, m + 1, 0);
+  }
+  return prev[m] / m;
 }
 
 sealed class FilterExpr {}
